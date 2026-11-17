@@ -4,7 +4,9 @@
 //
 //	raftkv-server --id node1 --config cluster.json --data ./data1
 //
-// --data 在 M1 只是占位参数：接受但不用（日志只放内存），M2 落盘时才用它。
+// --data 是持久化目录：日志（raft.log）与元数据（meta）落在里面，
+// 重启后可恢复。不传 --data 时日志只放内存，重启会丢数据
+// （仅测试用，生产不要这么跑）。
 package main
 
 import (
@@ -23,7 +25,7 @@ import (
 func main() {
 	id := flag.String("id", "", "本节点在 cluster.json 里的 id（如 node1）")
 	configPath := flag.String("config", "cluster.json", "集群配置文件路径")
-	dataDir := flag.String("data", "", "数据目录（M1 占位参数，接受但不用；M2 落盘时用）")
+	dataDir := flag.String("data", "", "数据目录（日志与元数据落盘位置；不传则只放内存，重启会丢数据）")
 	flag.Parse()
 
 	if *id == "" {
@@ -39,7 +41,11 @@ func main() {
 	}
 	n.Start()
 	self, _ := cfg.Get(*id)
-	log.Printf("节点 %s 启动，监听 %s（--data %q 在 M1 不用，重启会丢数据）", *id, self.Addr, *dataDir)
+	if *dataDir == "" {
+		log.Printf("节点 %s 启动，监听 %s（警告：未指定 --data，日志只放内存，重启会丢数据）", *id, self.Addr)
+	} else {
+		log.Printf("节点 %s 启动，监听 %s（数据目录 %q，重启可恢复）", *id, self.Addr, *dataDir)
+	}
 
 	// 等 Ctrl-C 或 kill 再优雅停机。
 	sig := make(chan os.Signal, 1)

@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -135,8 +137,14 @@ type Raft struct {
 // NewRaft 建一个节点，不启动任何 goroutine（Run 才启动）。
 // applyCh 由调用方消费（node 层把它交给 KV 状态机）；
 // 传 nil 时用一个带缓冲的默认 channel（单元测试可直接忽略它）。
-// 持久化状态从 persister.Load() 恢复（M1 的内存实现首次返回零值）。
-func NewRaft(id string, peers []string, addrs map[string]string, transport Transport, persister Persister, applyCh chan ApplyMsg) *Raft {
+// 持久化状态从 persister.Load() 恢复：term、votedFor、日志、lastApplied。
+// 恢复后 commitIndex 也设为 lastApplied——
+// 被应用过的条目一定是已提交的，设回去是安全的；
+// lastApplied 之后的已提交条目等新 leader 的心跳带 LeaderCommit
+// 过来后，再由 apply 循环正常应用。
+// Load 出错（meta 损坏、日志与 meta 自相矛盾）时返回错误，
+// 调用方应拒绝启动，而不是带着猜错的状态跑。
+func NewRaft(id string, peers []string, addrs map[string]string, transport Transport, persister Persister, applyCh chan ApplyMsg) (*Raft, error) {
 	if applyCh == nil {
 		applyCh = make(chan ApplyMsg, 100)
 	}
@@ -163,12 +171,21 @@ func NewRaft(id string, peers []string, addrs map[string]string, transport Trans
 			r.notifyChs[p] = make(chan struct{}, 1)
 		}
 	}
-	if st, err := persister.Load(); err == nil && len(st.Log) > 0 {
+	st, err := persister.Load()
+	if err != nil {
+		return nil, fmt.Errorf("恢复持久状态失败：%w", err)
+	}
+	if len(st.Log) > 0 {
 		r.currentTerm = st.CurrentTerm
 		r.votedFor = st.VotedFor
 		r.log = append([]LogEntry(nil), st.Log...)
 	}
-	return r
+	if st.LastApplied > len(r.log)-1 {
+		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只有 %d 条用户条目", st.LastApplied, len(r.log)-1)
+	}
+	r.lastApplied = st.LastApplied
+	r.commitIndex = st.LastApplied
+	return r, nil
 }
 
 // Run 启动选举计时器与 apply 循环。只调一次，多次调用是空操作。
@@ -203,6 +220,15 @@ func (r *Raft) LeaderID() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.leaderID
+}
+
+// RestoreInfo 返回持久日志的一份拷贝（含下标 0 的哨兵条目）与恢复出来的
+// lastApplied，供 node 层在启动时把 1..lastApplied 的已提交日志
+// 重放到 KV 状态机。
+func (r *Raft) RestoreInfo() ([]LogEntry, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]LogEntry(nil), r.log...), r.lastApplied
 }
 
 // LastApplied 返回已应用到状态机的最大日志下标。
@@ -253,17 +279,22 @@ func (r *Raft) lastLogIndexLocked() int { return len(r.log) - 1 }
 
 func (r *Raft) lastLogTermLocked() int { return r.log[len(r.log)-1].Term }
 
-// persistLocked 把持久状态写进 Persister（M1 是内存复制；
-// M2 的文件实现在这里 fsync，调用点不用改）。
+// persistLocked 把持久状态写进 Persister（文件实现里写文件 + fsync，
+// 调用点不用改）。
+// 持久化失败是致命错误：节点直接退出（fail-stop），而不是带着
+// 可能丢数据的状态继续服务、回复已经没法保证的写入。
+// 重启后从磁盘恢复，能恢复多少就是多少，不会把“已确认”的写丢了
+// 又装作没事。
 func (r *Raft) persistLocked() {
 	st := PersistentState{
 		CurrentTerm: r.currentTerm,
 		VotedFor:    r.votedFor,
 		Log:         append([]LogEntry(nil), r.log...),
+		LastApplied: r.lastApplied,
 	}
-	// M1 的内存实现不会失败；M2 的文件实现若返回错误，节点应报警停机，
-	// 但那是 M2 的逻辑——这里先忽略错误。
-	_ = r.persister.Save(st)
+	if err := r.persister.Save(st); err != nil {
+		log.Fatalf("节点 %s 持久化失败，停机（避免继续服务却丢数据）：%v", r.id, err)
+	}
 }
 
 // stepDownLocked 转成 follower（任期变成 term，票清空）。
@@ -601,6 +632,14 @@ func (r *Raft) runApplyLoop() {
 			r.mu.Unlock()
 			select {
 			case r.applyCh <- msg:
+				// 已投递给状态机消费端，落盘 lastApplied。
+				// 注意“投递”不等于“状态机已执行”：崩溃在两者之间时，
+				// 重启会把这条重放一遍——Put/Delete 都是幂等的，
+				// 多应用一条是安全的；且 lastApplied 永远 ≤ commitIndex，
+				// 重放的绝不会是未提交的尾部日志。
+				r.mu.Lock()
+				r.persistLocked()
+				r.mu.Unlock()
 			case <-r.done:
 				return
 			}

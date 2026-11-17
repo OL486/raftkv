@@ -36,17 +36,35 @@ type Node struct {
 	doneOnce sync.Once
 }
 
-// New 按配置建一个节点（不启动）。dataDir 是 M1 的占位参数：
-// 接受但不用，M2 落盘时才用它。
+// New 按配置建一个节点（不启动）。dataDir 是持久化目录：
+//   - 非空：日志与元数据落到该目录（FilePersister），重启可恢复；
+//   - 为空：用内存实现（仅测试用，进程退出即丢数据）。
+//
+// 建节点时会把持久状态恢复出来，并把 1..lastApplied 的已提交日志
+// 按序重放到 KV 状态机（只到 lastApplied——之后的条目等新 leader
+// 的心跳带 LeaderCommit 过来后，再由 apply 循环正常应用）。
 func New(cfg *cluster.Config, id string, dataDir string) (*Node, error) {
 	self, ok := cfg.Get(id)
 	if !ok {
 		return nil, fmt.Errorf("集群配置里没有节点 %q", id)
 	}
-	_ = dataDir // M1 占位：日志只放内存，不落盘
+
+	var persister raft.Persister
+	if dataDir == "" {
+		persister = &raft.MemoryPersister{}
+	} else {
+		fp, err := raft.NewFilePersister(dataDir)
+		if err != nil {
+			return nil, err
+		}
+		persister = fp
+	}
 
 	applyCh := make(chan raft.ApplyMsg, 100)
-	r := raft.NewRaft(id, cfg.IDs(), cfg.Addrs(), raft.NewHTTPTransport(), &raft.MemoryPersister{}, applyCh)
+	r, err := raft.NewRaft(id, cfg.IDs(), cfg.Addrs(), raft.NewHTTPTransport(), persister, applyCh)
+	if err != nil {
+		return nil, err
+	}
 	n := &Node{
 		ID:      id,
 		raft:    r,
@@ -54,6 +72,20 @@ func New(cfg *cluster.Config, id string, dataDir string) (*Node, error) {
 		waiters: make(map[int]chan struct{}),
 		applyCh: applyCh,
 		done:    make(chan struct{}),
+	}
+	// 启动恢复：重放已应用的日志。重放失败说明磁盘上的命令已损坏，
+	// 拒绝启动比带着错数据跑要安全。
+	logEntries, lastApplied := r.RestoreInfo()
+	if lastApplied > len(logEntries)-1 {
+		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只有 %d 条用户条目", lastApplied, len(logEntries)-1)
+	}
+	for i := 1; i <= lastApplied; i++ {
+		if err := n.store.Apply(logEntries[i].Command); err != nil {
+			return nil, fmt.Errorf("重放日志 %d 失败：%w", i, err)
+		}
+	}
+	if lastApplied > 0 {
+		log.Printf("节点 %s 从磁盘恢复：重放了 %d 条已提交日志", id, lastApplied)
 	}
 	mux := http.NewServeMux()
 	raft.RegisterRaftHandlers(mux, r)

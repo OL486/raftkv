@@ -2,16 +2,16 @@
 
 本文档逐项对照 Raft 论文（Diego Ongaro & John Ousterhout, "In Search of an
 Understandable Consensus Algorithm"）图 2 的规则，说明 raftkv 的实现状态。
-M1 实现的部分打 ✓，没做的标出去向（M2–M5）。
+M1 实现的部分打 ✓，M2 落盘后持久状态打 ✓（文件版），没做的标出去向（M3–M5）。
 
 ## 状态
 
 | 图 2 条目 | 实现 | 状态 |
 |---|---|---|
-| 持久状态 `currentTerm` | `raft.go` 的 `currentTerm`，每次改动后 `persistLocked()` | ✓（M1 存内存；M2 换文件实现，接口不变） |
-| 持久状态 `votedFor` | 同上 | ✓ 同上 |
-| 持久状态 `log[]`（每条 `{Term, Command}`） | `raft.go` 的 `log`，`log[0]` 是哨兵条目（Term 0），下标从 1 开始 | ✓ 同上 |
-| 易失状态 `commitIndex`、`lastApplied` | `raft.go` 的同名字段 | ✓ |
+| 持久状态 `currentTerm` | `raft.go` 的 `currentTerm`，每次改动后 `persistLocked()`；M2 起落盘到 `--data/meta`（`persist_file.go`） | ✓（M2 文件版） |
+| 持久状态 `votedFor` | 同上；投票前必须先落盘（见 `docs/02-persistence.md`） | ✓（M2 文件版） |
+| 持久状态 `log[]`（每条 `{Term, Command}`） | `raft.go` 的 `log`，`log[0]` 是哨兵条目（Term 0），下标从 1 开始；M2 起落盘到 `--data/raft.log`（追加写 + fsync） | ✓（M2 文件版） |
+| 易失状态 `commitIndex`、`lastApplied` | `raft.go` 的同名字段；`lastApplied` 额外落盘进 `meta`，用于启动重放划清边界（重启时 `commitIndex` 恢复为 `lastApplied`） | ✓ |
 | Leader 易失状态 `nextIndex[]`、`matchIndex[]` | `raft.go` 的同名 map，当选 leader 时初始化 | ✓ |
 
 ## RequestVote RPC
@@ -68,7 +68,7 @@ M1 实现的部分打 ✓，没做的标出去向（M2–M5）。
 
 | 内容 | 去向 |
 |---|---|
-| 持久化落盘（`Save` 写文件 + fsync，重启恢复） | M2（接口 `Persister` 已留好，`raft.go` 不动） |
+| 持久化落盘（`Save` 写文件 + fsync，重启恢复） | M2 已完成：`FilePersister`（`internal/raft/persist_file.go`），格式与 fsync 点见 `docs/02-persistence.md` |
 | InstallSnapshot RPC 与日志压缩 | M5 |
 | Pre-Vote（防分区后旧 leader 搅局） | 明确不做（见规划） |
 | ReadIndex 读优化 | 明确不做；读 follower 可能读到旧数据，已在文档写明 |

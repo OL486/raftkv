@@ -10,13 +10,18 @@ type LogEntry struct {
 	Command []byte `json:"command"`
 }
 
-// PersistentState 是 Raft 论文要求“在回复 RPC 之前必须落盘”的全部状态。
-// M1 只用内存实现（MemoryPersister）；M2 会换成文件实现，
-// 届时只替换 Persister，raft.go 不动。
+// PersistentState 是 Raft 论文要求“在回复 RPC 之前必须落盘”的全部状态，
+// 再加一个 LastApplied：已应用到状态机的最大日志下标。
+// 重启时只把 1..LastApplied 的日志重放到状态机——LastApplied 永远 ≤
+// commitIndex，所以重放的都是已提交的条目，绝不会把未提交的尾部日志
+// 喂给状态机；LastApplied 之后的已提交条目等新 leader 的心跳带
+// LeaderCommit 过来后再由 apply 循环正常应用。
+// M2 用文件实现（FilePersister，见 persist_file.go）；内存实现只留给测试。
 type PersistentState struct {
 	CurrentTerm int        `json:"currentTerm"`
 	VotedFor    string     `json:"votedFor"`
 	Log         []LogEntry `json:"log"`
+	LastApplied int        `json:"lastApplied"`
 }
 
 // Persister 是持久状态的存储抽象。Raft 核心只调这两个方法，
@@ -29,8 +34,8 @@ type Persister interface {
 	Load() (PersistentState, error)
 }
 
-// MemoryPersister 是 Persister 的内存实现，仅供 M1 使用：
-// 进程退出即丢数据，重启恢复是 M2 的事。
+// MemoryPersister 是 Persister 的内存实现，仅供测试使用：
+// 进程退出即丢数据；生产路径（cmd/server）用 FilePersister。
 type MemoryPersister struct {
 	mu    sync.Mutex
 	state PersistentState
@@ -45,6 +50,7 @@ func (m *MemoryPersister) Save(s PersistentState) error {
 		CurrentTerm: s.CurrentTerm,
 		VotedFor:    s.VotedFor,
 		Log:         append([]LogEntry(nil), s.Log...),
+		LastApplied: s.LastApplied,
 	}
 	m.saved = true
 	return nil
@@ -61,5 +67,6 @@ func (m *MemoryPersister) Load() (PersistentState, error) {
 		CurrentTerm: m.state.CurrentTerm,
 		VotedFor:    m.state.VotedFor,
 		Log:         append([]LogEntry(nil), m.state.Log...),
+		LastApplied: m.state.LastApplied,
 	}, nil
 }
