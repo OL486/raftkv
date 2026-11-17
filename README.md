@@ -6,7 +6,7 @@
 客户端写一条 Put，要经过选主、日志复制、多数派提交、按序应用到状态机，
 三个节点的 KV 内容最终一致；杀掉一个节点（甚至杀掉 leader）服务不中断。
 
-## 当前状态：M2（持久化与重启恢复）
+## 当前状态：M3（确定性模拟器）
 
 能跑的：
 
@@ -20,13 +20,18 @@
   （`currentTerm` / `votedFor` / `lastApplied` 的 JSON，原子写）；
   kill -9 后重启，term 与日志全在，数据不丢；写一半的尾巴自动截断丢弃。
   详见 `docs/02-persistence.md`。
+- **确定性模拟器**：三个 Raft 实例跑在同一个进程里，虚拟时钟 +
+  模拟网络（可编程丢包、延迟、分区）+ 随机故障注入（分区、杀节点、
+  重启、写请求）；每步检查三个不变式（同一任期最多一个 leader、
+  已提交日志永不丢失、状态机按序应用）；同一种子跑两次结果完全相同。
+  详见 `docs/03-testing.md`，跑 `make sim`。
 
 不能跑的（按规划，后面里程碑做）：
 
 - 快照与日志压缩（M5）：日志只增不减，写 10 万条后 `raft.log` 就是
   10 万条的量，启动时全量读回；每条写都 fsync、每次应用都写 meta，
   写吞吐不高——这是 M2 的设计取舍。
-- 确定性模拟器（M3）、线性一致性检查（M4）。
+- 线性一致性检查（M4）。
 - 动态加节点、Pre-Vote、ReadIndex 读优化、TLS、WATCH、跨 key 事务：
   明确不做，见 `~/workspace/tech-project-plans.md` 项目 3 的不做清单。
 
@@ -130,17 +135,20 @@ raftkv/
 ├── internal/
 │   ├── raft/
 │   │   ├── raft.go           # 核心：选举、复制、提交、apply 循环（论文图 2）
+│   │   ├── clock.go          # Clock 接口 + RealClock（M3：时间抽象，模拟用虚拟时钟）
 │   │   ├── log.go            # 持久状态类型 + Persister 接口 + 内存实现
 │   │   ├── persist_file.go   # FilePersister：raft.log + meta 的文件实现
 │   │   ├── persist_file_test.go  # 文件级测试（round-trip、CRC 截断、原子写）
 │   │   ├── crash_test.go     # 真实进程崩溃测试（kill -9 后重启恢复）
-│   │   └── transport.go      # HTTP + JSON 传输、term 校验
+│   │   └── transport.go      # HTTP + JSON 传输（M3：异步回调式）、term 校验
+│   ├── sim/                  # M3 确定性模拟器：虚拟时钟、模拟网络、故障注入、不变式
 │   ├── kv/store.go           # KV 状态机：Put/Delete/Get（纯逻辑，不碰网络/磁盘）
 │   ├── cluster/config.go     # 静态配置解析
 │   └── node/node.go          # 节点组装：Raft + KV + HTTP 服务 + put 等待逻辑
 ├── docs/
 │   ├── 01-raft-figure2.md    # 对照论文图 2 的实现逐项说明
-│   └── 02-persistence.md     # 持久化格式、fsync 点、崩溃处理、重启重放
+│   ├── 02-persistence.md     # 持久化格式、fsync 点、崩溃处理、重启重放
+│   └── 03-testing.md         # M3：模拟器用法、不变式、故障矩阵、确定性说明
 └── scripts/
     ├── demo.sh               # M1 + M2 全流程演示
     └── run-cluster.sh        # 起三节点集群（make run 用）
@@ -151,6 +159,7 @@ raftkv/
 ```bash
 make check   # vet + gofmt 检查 + go test -race
 make test    # go test ./... -count=1 -race（并发是本项目的命，race 必须开）
+make sim     # 模拟器长跑：故障矩阵（9 场景 × 3 种子）+ 1000 步随机长跑
 ```
 
 ## M1 实测记录（2026-11-17，本机）
@@ -197,3 +206,28 @@ make test    # go test ./... -count=1 -race（并发是本项目的命，race �
   （100 → 111，无回退、无半条日志）。
 - `scripts/demo.sh` 已扩展 M2 段：写 10 条 → kill -9 全部节点 →
   逐个重启 → 数据全在、term 与日志长度一致、重启后写入正常。
+
+## M3 实测记录（2026-11-17，本机）
+
+- `go test ./... -count=1 -race`：**39 个顶层测试全绿**（M1/M2 的 28 个
+  一个不少 + 模拟器 11 个：虚拟时钟 4 个、网络 3 个、故障矩阵 1 个
+  （27 个子测试）、随机长跑 1 个、确定性 1 个、性能 1 个）；
+  `go vet` 全绿；`gofmt -l` 为空；`make check` 与 `make sim` 通过；
+  `scripts/demo.sh` 仍通过（重构没改真实路径行为）。
+- 故障矩阵（`TestFaultMatrix`）：9 个场景 × 种子 1/2/3 = **27/27 通过**，
+  包括分区（单节点孤立、2 对 1 分裂）、崩溃（leader、follower、连续两个）、
+  重启（立即、隔 5 秒）与混合场景（分区 + 杀 leader + 重启 + 写）。
+- 随机故障长跑（种子 42，1000 步）：写 386（成功 194 / 失败 192）、
+  分区 103 / 恢复 88、杀 142 / 重启 142，三个不变式**全程成立**，
+  最终已提交日志 220 条、KV 220 条。
+- 确定性（种子 42，1000 步跑两次）：最终已提交日志 220 条、
+  最终 KV **完全相同**；leader 历史也完全相同（4820 次切换）——
+  没有残留的非确定性。
+- 性能：1000 步随机长跑 **3.0 秒**（上限 10 秒）。
+- 模拟器调试时发现并修好的两个检查 bug（不是 Raft 的 bug，详见
+  `docs/03-testing.md`）：不变式 (b) 的水位线必须从 `commitIndex`
+  最大的节点取、比较只到各节点的 `commitIndex`；收敛检查只比
+  已提交前缀（follower 的未提交旧尾巴不会马上被截掉，是标准 Raft 行为）。
+- 重构时修了一个真实竞争：不调 `Run()` 的测试节点也会排
+  `time.AfterFunc` 定时器，测试结束后回调与已结束的对象竞争
+  （`-race` 抓到）；现在没 `Run()` 的节点不排定时器。

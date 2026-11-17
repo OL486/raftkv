@@ -99,6 +99,16 @@ type DebugInfo struct {
 // Raft 是一个 Raft 节点。所有状态都由 mu 保护；
 // RPC handler 只做“收包、加锁、处理、回包”，不直接碰状态机；
 // 对外 RPC 一律在不持锁时发出。
+//
+// 并发结构（M3 重构后）：
+//   - 选举计时与逐 follower 的复制心跳走 Clock.AfterFunc 回调链，
+//     不再各起一个 goroutine：回调里发 RPC、收回复（经 Transport 的
+//     cb），决策都在回调里同步完成；
+//   - 只有 apply 循环还是 goroutine（它只负责把已提交日志按序
+//     交给状态机，时序不影响决策；模拟器在断言前把它排空）。
+//
+// 这样一来，模拟器用虚拟时钟驱动时，全部决策都在 Advance 的调用栈里
+// 同步发生，不受 goroutine 调度影响——同一种子两次跑的结果相同。
 type Raft struct {
 	mu sync.Mutex
 
@@ -106,6 +116,8 @@ type Raft struct {
 	peers     []string          // 集群全部节点 id（含自己）
 	addrs     map[string]string // 节点 id -> host:port（不含自己也行，查不到就跳过）
 	transport Transport
+	clock     Clock
+	rng       *rand.Rand // 选举超时的随机源：生产用时间种子，模拟器注入带种子的
 
 	// 持久状态（论文图 2；每次改动后调 persistLocked）。
 	state       Role
@@ -123,15 +135,45 @@ type Raft struct {
 	matchIndex map[string]int
 	leaderID   string
 
+	// 选举计时器（AfterFunc 回调链）：同一时刻最多一个在排队。
+	// electionGen 是代次——旧回调（已被停止、或在 Stop 与回调
+	// 的竞态里漏网的）靠它认出自己已过期，直接返回。
+	electionTimer Timer
+	electionGen   int
+	// replTimers 是各 follower 的复制心跳回调句柄（leader 才有）。
+	replTimers map[string]Timer
+
 	persister     Persister
 	applyCh       chan ApplyMsg
 	applyNotifyCh chan struct{}
-	resetCh       chan struct{}
-	notifyChs     map[string]chan struct{}
 
 	done     chan struct{}
 	stopOnce sync.Once
 	running  bool
+	stopped  bool // Stop() 后置位：所有回调先查它，已停的节点直接返回
+}
+
+// RaftOption 是 NewRaft 的可选参数（Clock 与随机源，不传用默认的
+// 真实实现；模拟器注入虚拟时钟与带种子的 RNG）。
+type RaftOption func(*Raft)
+
+// WithClock 指定 Raft 用的时钟（默认真实时钟）。
+func WithClock(c Clock) RaftOption {
+	return func(r *Raft) {
+		if c != nil {
+			r.clock = c
+		}
+	}
+}
+
+// WithRand 指定选举超时的随机源（默认用当前时间做种子）。
+// 模拟器给每个节点一个带种子的 RNG，让选举超时序列可复现。
+func WithRand(rng *rand.Rand) RaftOption {
+	return func(r *Raft) {
+		if rng != nil {
+			r.rng = rng
+		}
+	}
 }
 
 // NewRaft 建一个节点，不启动任何 goroutine（Run 才启动）。
@@ -144,7 +186,9 @@ type Raft struct {
 // 过来后，再由 apply 循环正常应用。
 // Load 出错（meta 损坏、日志与 meta 自相矛盾）时返回错误，
 // 调用方应拒绝启动，而不是带着猜错的状态跑。
-func NewRaft(id string, peers []string, addrs map[string]string, transport Transport, persister Persister, applyCh chan ApplyMsg) (*Raft, error) {
+// opts 可注入 Clock（默认真实时钟）与 RNG（默认时间种子），
+// 模拟器用它换虚拟时钟与可复现的随机源。
+func NewRaft(id string, peers []string, addrs map[string]string, transport Transport, persister Persister, applyCh chan ApplyMsg, opts ...RaftOption) (*Raft, error) {
 	if applyCh == nil {
 		applyCh = make(chan ApplyMsg, 100)
 	}
@@ -153,23 +197,24 @@ func NewRaft(id string, peers []string, addrs map[string]string, transport Trans
 		peers:         append([]string(nil), peers...),
 		addrs:         addrs,
 		transport:     transport,
+		clock:         NewRealClock(),
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 		state:         Follower,
 		log:           []LogEntry{{Term: 0}},
 		nextIndex:     make(map[string]int),
 		matchIndex:    make(map[string]int),
+		replTimers:    make(map[string]Timer),
 		persister:     persister,
 		applyCh:       applyCh,
 		applyNotifyCh: make(chan struct{}, 1),
-		resetCh:       make(chan struct{}, 1),
-		notifyChs:     make(map[string]chan struct{}),
 		done:          make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(r)
 	}
 	for _, p := range r.peers {
 		r.nextIndex[p] = 1
 		r.matchIndex[p] = 0
-		if p != id {
-			r.notifyChs[p] = make(chan struct{}, 1)
-		}
 	}
 	st, err := persister.Load()
 	if err != nil {
@@ -196,14 +241,20 @@ func (r *Raft) Run() {
 		return
 	}
 	r.running = true
+	r.armElectionTimerLocked()
 	r.mu.Unlock()
-	go r.runElectionTimer()
 	go r.runApplyLoop()
 }
 
-// Stop 停掉本节点的所有后台 goroutine（选举计时、apply 循环、
-// 各 follower 的复制循环）。可多次调用。HTTP 服务由调用方另行停。
+// Stop 停掉本节点的所有后台工作（选举计时、复制心跳、apply 循环）。
+// 已排队的回调靠 stopped 标志与代次认出自己已过期，直接返回。
+// 可多次调用。HTTP 服务由调用方另行停。
 func (r *Raft) Stop() {
+	r.mu.Lock()
+	r.stopped = true
+	r.stopElectionTimerLocked()
+	r.stopReplicateTimersLocked()
+	r.mu.Unlock()
 	r.stopOnce.Do(func() { close(r.done) })
 }
 
@@ -253,6 +304,15 @@ func (r *Raft) Debug() DebugInfo {
 	}
 }
 
+// LogSnapshot 返回日志的一份拷贝（含下标 0 的哨兵条目）与当前的
+// commitIndex、lastApplied。模拟器的不变式检查用它比对各节点日志；
+// 返回的是拷贝，调用方改了也不会影响节点内部状态。
+func (r *Raft) LogSnapshot() ([]LogEntry, int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]LogEntry(nil), r.log...), r.commitIndex, r.lastApplied
+}
+
 // Start 是客户端写入的入口（只在 leader 上有效）。
 // 把命令追加到本地日志，返回它的下标与任期；
 // 不是 leader 时返回 isLeader=false，调用方应去找 leader。
@@ -297,22 +357,52 @@ func (r *Raft) persistLocked() {
 	}
 }
 
-// stepDownLocked 转成 follower（任期变成 term，票清空）。
+// stepDownLocked 转成 follower（任期变成 term，票清空），
+// 并重新开始选举计时。
 func (r *Raft) stepDownLocked(term int) {
 	r.state = Follower
 	r.currentTerm = term
 	r.votedFor = ""
 	r.leaderID = ""
+	r.stopReplicateTimersLocked()
 	r.persistLocked()
-	r.resetElectionTimerLocked()
+	r.armElectionTimerLocked()
 }
 
-// resetElectionTimerLocked 让选举计时器重新开始计时（非阻塞发送，
-// 计时器 goroutine 下一轮 select 会收到；持锁调用是安全的）。
-func (r *Raft) resetElectionTimerLocked() {
-	select {
-	case r.resetCh <- struct{}{}:
-	default:
+// armElectionTimerLocked 重新开始选举计时：停掉旧的，
+// 用新的随机超时（150–300ms）排一个回调。调用方必须持 mu。
+// 回调捕获排队时的代次，旧回调（停掉后漏网的、或与 Stop 竞态的）
+// 靠代次认出自己已过期，直接返回。
+// 没调 Run() 的节点不排计时器（单元测试直接调 handler，不启动节点，
+// 排了也没人消费，还会在测试结束后漏网回调、读写已结束的测试对象）。
+func (r *Raft) armElectionTimerLocked() {
+	if r.stopped || !r.running {
+		return
+	}
+	r.stopElectionTimerLocked()
+	r.electionGen++
+	gen := r.electionGen
+	d := r.electionTimeout()
+	r.electionTimer = r.clock.AfterFunc(d, func() { r.onElectionTimeout(gen) })
+}
+
+// stopElectionTimerLocked 停掉当前排队的选举计时器（有的话）。
+// 调用方必须持 mu。
+func (r *Raft) stopElectionTimerLocked() {
+	if r.electionTimer != nil {
+		r.electionTimer.Stop()
+		r.electionTimer = nil
+	}
+}
+
+// stopReplicateTimersLocked 停掉全部 follower 的复制心跳回调。
+// 调用方必须持 mu。
+func (r *Raft) stopReplicateTimersLocked() {
+	for peer, t := range r.replTimers {
+		if t != nil {
+			t.Stop()
+		}
+		delete(r.replTimers, peer)
 	}
 }
 
@@ -324,14 +414,45 @@ func (r *Raft) notifyApplyLocked() {
 	}
 }
 
-// notifyFollowersLocked 唤醒各 follower 的复制循环（有新日志要发）。
+// notifyFollowersLocked 收到新日志后立刻给各 follower 发一次
+// AppendEntries（不等下一轮 50ms 心跳）：把各 peer 的心跳回调
+// 提前到现在。调用方必须持 mu（排回调本身不发包、不阻塞）。
 func (r *Raft) notifyFollowersLocked() {
-	for _, ch := range r.notifyChs {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
+	if r.state != Leader {
+		return
 	}
+	for _, p := range r.peers {
+		if p == r.id {
+			continue
+		}
+		r.triggerReplicateLocked(p)
+	}
+}
+
+// triggerReplicateLocked 把某 follower 的下一次复制提前到现在：
+// 停掉它排队的心跳回调，改排一个立即执行的。调用方必须持 mu。
+// 没调 Run() 的节点不排回调（同 armElectionTimerLocked 的原因）。
+func (r *Raft) triggerReplicateLocked(peer string) {
+	if r.stopped || !r.running || r.state != Leader {
+		return
+	}
+	if t, ok := r.replTimers[peer]; ok && t != nil {
+		t.Stop()
+	}
+	term := r.currentTerm
+	r.replTimers[peer] = r.clock.AfterFunc(0, func() { r.replicateOnce(peer, term) })
+}
+
+// scheduleReplicateLocked 给某 follower 排一次心跳回调（delay 后执行）。
+// 调用方必须持 mu。没调 Run() 的节点不排回调。
+func (r *Raft) scheduleReplicateLocked(peer string, delay time.Duration, term int) {
+	if r.stopped || !r.running || r.state != Leader || r.currentTerm != term {
+		return
+	}
+	if t, ok := r.replTimers[peer]; ok && t != nil {
+		t.Stop()
+	}
+	r.replTimers[peer] = r.clock.AfterFunc(delay, func() { r.replicateOnce(peer, term) })
 }
 
 // advanceCommitIndexLocked 按论文图 2 的 leader 规则推进 commitIndex：
@@ -356,38 +477,38 @@ func (r *Raft) advanceCommitIndexLocked() {
 // ---- 选举 ----
 
 // electionTimeout 返回一次随机选举超时（150–300ms）。
-func electionTimeout() time.Duration {
-	return ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
+// 用节点自己的 RNG：模拟器注入带种子的 RNG，超时序列可复现。
+func (r *Raft) electionTimeout() time.Duration {
+	return ElectionTimeoutMin + time.Duration(r.rng.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
 }
 
-// runElectionTimer 是选举计时 goroutine：超时未收到心跳（或投票）就参选。
-// leader 也跑这个循环，但超时后直接跳过（不参选）。
-func (r *Raft) runElectionTimer() {
-	for {
-		timer := time.NewTimer(electionTimeout())
-		select {
-		case <-r.done:
-			timer.Stop()
-			return
-		case <-r.resetCh:
-			timer.Stop()
-			continue
-		case <-timer.C:
-		}
-		r.mu.Lock()
-		if r.state == Leader {
-			r.mu.Unlock()
-			continue
-		}
+// onElectionTimeout 是选举计时器的回调：超时未收到心跳（或投票）就参选。
+// gen 是排队时的代次——过期回调（已被新的计时取代、或节点已停）直接返回。
+// 回调在时钟的 goroutine / 虚拟时钟的事件循环里执行，不持锁进入。
+func (r *Raft) onElectionTimeout(gen int) {
+	r.mu.Lock()
+	if r.stopped || gen != r.electionGen {
 		r.mu.Unlock()
-		r.startElection()
+		return
 	}
+	if r.state == Leader {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	r.startElection()
 }
 
-// startElection 发起一次选举：任期 +1、投自己一票、并行向其他节点拉票。
-// 拿到多数票就地转 leader；收到更大任期就退回 follower。
+// startElection 发起一次选举：任期 +1、投自己一票、向其他节点拉票。
+// 拉票是同步发、回调计票：发出去就返回，回复到了在回调里处理
+// （拿到多数票就地转 leader；收到更大任期就退回 follower）。
+// 选完立刻重排下一次超时——这次选不上，超时后会再选一轮。
 func (r *Raft) startElection() {
 	r.mu.Lock()
+	if r.stopped || r.state == Leader {
+		r.mu.Unlock()
+		return
+	}
 	r.currentTerm++
 	r.state = Candidate
 	r.votedFor = r.id
@@ -399,6 +520,7 @@ func (r *Raft) startElection() {
 		LastLogIndex: r.lastLogIndexLocked(),
 		LastLogTerm:  r.lastLogTermLocked(),
 	}
+	r.armElectionTimerLocked()
 	r.mu.Unlock()
 
 	votes := 1 // 自己的一票（下面所有读写都在 r.mu 保护下进行）
@@ -406,18 +528,17 @@ func (r *Raft) startElection() {
 		if peer == r.id {
 			continue
 		}
-		go func(peer string) {
-			addr, ok := r.addrs[peer]
-			if !ok {
-				return
-			}
-			reply, err := r.transport.RequestVote(addr, &args)
+		addr, ok := r.addrs[peer]
+		if !ok {
+			continue
+		}
+		r.transport.RequestVote(addr, &args, func(reply *RequestVoteReply, err error) {
 			if err != nil {
-				return
+				return // 消息丢了：等下一次选举重试，不在这里重试
 			}
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			if r.state != Candidate || r.currentTerm != term {
+			if r.stopped || r.state != Candidate || r.currentTerm != term {
 				return // 已经不是这次选举的候选人了
 			}
 			if reply.Term > r.currentTerm {
@@ -431,23 +552,24 @@ func (r *Raft) startElection() {
 			if votes > len(r.peers)/2 {
 				r.becomeLeaderLocked()
 			}
-		}(peer)
+		})
 	}
 
 	// 单节点集群：自己的一票就是多数派，没有别的节点可拉票，
-	// 上面的循环一个 goroutine 都不会起，必须在这里直接当选。
+	// 上面的循环一个请求都不会发，必须在这里直接当选。
 	r.mu.Lock()
-	if r.state == Candidate && r.currentTerm == term && votes > len(r.peers)/2 {
+	if !r.stopped && r.state == Candidate && r.currentTerm == term && votes > len(r.peers)/2 {
 		r.becomeLeaderLocked()
 	}
 	r.mu.Unlock()
 }
 
 // becomeLeaderLocked 转成 leader：初始化各 follower 的 nextIndex / matchIndex，
-// 立刻发一轮心跳，并为每个 follower 起一个复制循环。
+// 立刻给每人发一轮心跳（delay 0 的回调），并排好之后每 50ms 的心跳链。
 func (r *Raft) becomeLeaderLocked() {
 	r.state = Leader
 	r.leaderID = r.id
+	r.stopElectionTimerLocked() // leader 不需要选举计时器
 	last := r.lastLogIndexLocked()
 	for _, p := range r.peers {
 		r.nextIndex[p] = last + 1
@@ -456,63 +578,52 @@ func (r *Raft) becomeLeaderLocked() {
 	r.matchIndex[r.id] = last
 	r.nextIndex[r.id] = last + 1
 	r.notifyFollowersLocked()
-	for _, p := range r.peers {
-		if p == r.id {
-			continue
-		}
-		go r.replicateTo(p)
-	}
 }
 
-// replicateTo 是一个 follower 的专属复制循环：每 50ms 发一次 AppendEntries
-// （有新日志时立刻发，不等心跳间隔）。
-func (r *Raft) replicateTo(peer string) {
-	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.done:
-			return
-		case <-r.notifyChs[peer]:
-		case <-ticker.C:
-		}
-
-		r.mu.Lock()
-		if r.state != Leader {
-			r.mu.Unlock()
-			return
-		}
-		next := r.nextIndex[peer]
-		args := AppendEntriesArgs{
-			Term:         r.currentTerm,
-			LeaderID:     r.id,
-			PrevLogIndex: next - 1,
-			PrevLogTerm:  r.log[next-1].Term,
-			LeaderCommit: r.commitIndex,
-		}
-		if next <= r.lastLogIndexLocked() {
-			args.Entries = append([]LogEntry(nil), r.log[next:]...)
-		}
+// replicateOnce 给一个 follower 发一次 AppendEntries（心跳或带日志）。
+// 发完立刻排好下一次心跳（50ms 后），形成回调链；
+// 任期变了 / 退回 follower / 节点停了，链就断了，不再排。
+// 回调在时钟的 goroutine / 虚拟时钟的事件循环里执行，不持锁进入。
+func (r *Raft) replicateOnce(peer string, term int) {
+	r.mu.Lock()
+	if r.stopped || r.state != Leader || r.currentTerm != term {
 		r.mu.Unlock()
+		return
+	}
+	next := r.nextIndex[peer]
+	args := AppendEntriesArgs{
+		Term:         r.currentTerm,
+		LeaderID:     r.id,
+		PrevLogIndex: next - 1,
+		PrevLogTerm:  r.log[next-1].Term,
+		LeaderCommit: r.commitIndex,
+	}
+	if next <= r.lastLogIndexLocked() {
+		args.Entries = append([]LogEntry(nil), r.log[next:]...)
+	}
+	// 先排好下一次心跳，再发包：对端再慢也不影响心跳节奏。
+	r.scheduleReplicateLocked(peer, HeartbeatInterval, term)
+	r.mu.Unlock()
 
-		addr, ok := r.addrs[peer]
-		if !ok {
+	addr, ok := r.addrs[peer]
+	if !ok {
+		return
+	}
+	r.transport.AppendEntries(addr, &args, func(reply *AppendEntriesReply, err error) {
+		if err != nil {
+			return // 消息丢了：等下一轮心跳重试
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.stopped {
 			return
 		}
-		reply, err := r.transport.AppendEntries(addr, &args)
-		if err != nil {
-			continue // 网络不通就等下一轮心跳重试
-		}
-
-		r.mu.Lock()
 		if reply.Term > r.currentTerm {
 			r.stepDownLocked(reply.Term)
-			r.mu.Unlock()
 			return
 		}
 		if r.state != Leader || r.currentTerm != args.Term {
-			r.mu.Unlock()
-			continue // 任期已变，这次回复作废
+			return // 任期已变，这次回复作废
 		}
 		if reply.Success {
 			r.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
@@ -521,10 +632,10 @@ func (r *Raft) replicateTo(peer string) {
 		} else if r.nextIndex[peer] > 1 {
 			// 日志不一致：一次回退一格再试（M1 求简单正确；
 			// 快速回退是 M2 之后的优化，见规划风险 2）。
+			// 下次心跳发的是回退后的位置，不用立刻重发。
 			r.nextIndex[peer]--
 		}
-		r.mu.Unlock()
-	}
+	})
 }
 
 // ---- RPC 处理（transport 层调这两个方法；单元测试也直接调） ----
@@ -548,7 +659,7 @@ func (r *Raft) HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		r.votedFor = args.CandidateID
 		r.persistLocked()
 		reply.VoteGranted = true
-		r.resetElectionTimerLocked()
+		r.armElectionTimerLocked()
 	}
 	reply.Term = r.currentTerm
 	return reply
@@ -573,7 +684,7 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 		r.state = Follower
 	}
 	r.leaderID = args.LeaderID
-	r.resetElectionTimerLocked()
+	r.armElectionTimerLocked()
 
 	// 一致性检查：PrevLogIndex 处的任期必须与 leader 说的一致。
 	if args.PrevLogIndex > r.lastLogIndexLocked() {
@@ -611,15 +722,16 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 
 // runApplyLoop 把已提交的日志按序交给状态机（经 applyCh）。
 // lastApplied 只在这里前进，保证应用顺序与日志顺序一致。
+// 兜底 ticker 也走 Clock（模拟器里是虚拟时钟）。
 func (r *Raft) runApplyLoop() {
-	ticker := time.NewTicker(applyTickInterval)
+	ticker := r.clock.NewTicker(applyTickInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-r.done:
 			return
 		case <-r.applyNotifyCh:
-		case <-ticker.C:
+		case <-ticker.C():
 		}
 		for {
 			r.mu.Lock()

@@ -84,3 +84,15 @@ func (s *Store) Len() int {
 	defer s.mu.RUnlock()
 	return len(s.data)
 }
+
+// All 返回全量 key/value 的一份拷贝（模拟器比较各节点状态机用）。
+// 返回的是拷贝，调用方改了也不会影响状态机。
+func (s *Store) All() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]string, len(s.data))
+	for k, v := range s.data {
+		out[k] = v
+	}
+	return out
+}

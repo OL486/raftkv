@@ -8,11 +8,17 @@ import (
 	"time"
 )
 
-// Transport 是 Raft 节点之间发 RPC 的抽象。M1 只有 HTTP + JSON 一种实现；
-// 模拟器（M3）会换成进程内 channel 实现，届时 raft.go 不动。
+// Transport 是 Raft 节点之间发 RPC 的抽象。RPC 是异步的：
+// 发出去就返回，回复到了调 cb（可能在另一个 goroutine 里，
+// 也可能——模拟器里——在虚拟时钟的事件循环里同步调）。
+// cb 收到回复后必须自己判断“这次回复还作不作数”
+// （比如任期已经变了），因为慢回复可能在重试之后才到。
+// 消息丢了时 cb 永远不会被调用（与真实网络的超时等价，
+// 只是没有错误值）：调用方靠下一轮心跳 / 选举重试兜底，
+// 不要在 cb 之外等回复。
 type Transport interface {
-	RequestVote(addr string, args *RequestVoteArgs) (*RequestVoteReply, error)
-	AppendEntries(addr string, args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	RequestVote(addr string, args *RequestVoteArgs, cb func(*RequestVoteReply, error))
+	AppendEntries(addr string, args *AppendEntriesArgs, cb func(*AppendEntriesReply, error))
 }
 
 // HTTPTransport 用 HTTP + JSON 发 RPC（选它不选 gRPC 的理由：
@@ -28,14 +34,20 @@ func NewHTTPTransport() *HTTPTransport {
 	return &HTTPTransport{client: &http.Client{Timeout: 150 * time.Millisecond}}
 }
 
-// RequestVote 发投票请求。
-func (t *HTTPTransport) RequestVote(addr string, args *RequestVoteArgs) (*RequestVoteReply, error) {
-	return postJSON[RequestVoteArgs, RequestVoteReply](t.client, "http://"+addr+"/raft/requestVote", *args)
+// RequestVote 发投票请求。回复到了调 cb（在新起的 goroutine 里）。
+func (t *HTTPTransport) RequestVote(addr string, args *RequestVoteArgs, cb func(*RequestVoteReply, error)) {
+	go func() {
+		reply, err := postJSON[RequestVoteArgs, RequestVoteReply](t.client, "http://"+addr+"/raft/requestVote", *args)
+		cb(reply, err)
+	}()
 }
 
-// AppendEntries 发日志复制/心跳请求。
-func (t *HTTPTransport) AppendEntries(addr string, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
-	return postJSON[AppendEntriesArgs, AppendEntriesReply](t.client, "http://"+addr+"/raft/appendEntries", *args)
+// AppendEntries 发日志复制/心跳请求。回复到了调 cb（在新起的 goroutine 里）。
+func (t *HTTPTransport) AppendEntries(addr string, args *AppendEntriesArgs, cb func(*AppendEntriesReply, error)) {
+	go func() {
+		reply, err := postJSON[AppendEntriesArgs, AppendEntriesReply](t.client, "http://"+addr+"/raft/appendEntries", *args)
+		cb(reply, err)
+	}()
 }
 
 // postJSON 把 req 编成 JSON POST 过去，再把响应体解成 Resp。

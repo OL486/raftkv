@@ -102,7 +102,9 @@ func (n *Node) Start() {
 	n.raft.Run()
 	go func() {
 		if err := n.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("节点 %s 的 HTTP 服务退出：%v", n.ID, err)
+			// 监听失败是致命的：端口被占就说明旧进程还没退出或配置冲突，
+			// 带着坏 HTTP 继续跑只会让 Raft 当选了 leader 却没人能连上。
+			log.Fatalf("节点 %s 的 HTTP 服务无法启动：%v", n.ID, err)
 		}
 	}()
 }

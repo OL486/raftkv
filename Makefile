@@ -6,7 +6,7 @@
 GO := $(shell command -v go 2>/dev/null || echo $(HOME)/go/bin/go)
 GOFMT := $(shell command -v gofmt 2>/dev/null || echo $(HOME)/go/bin/gofmt)
 
-.PHONY: check test vet fmt build run clean
+.PHONY: check test vet fmt build run clean sim
 
 # 默认目标：完整检查（vet + gofmt 检查 + 带 -race 的全量测试）。
 check: vet fmt test
@@ -22,6 +22,12 @@ fmt:
 # test：全量测试，必须开 -race（并发是本项目的命）。
 test:
 	$(GO) test ./... -count=1 -race
+
+# sim：模拟器长跑——故障矩阵（9 个场景 × 种子 1/2/3）
+# 加一次 1000 步随机故障长跑（种子 42）。确定性与性能测试
+# 在 make check 的全量测试里跑。
+sim:
+	$(GO) test ./internal/sim/ -count=1 -race -run 'TestFaultMatrix|TestRandomFaultLong_1000Steps' -v
 
 # build：编译两个二进制到 /tmp/raftkv-bin（不留在工作目录里）。
 build:

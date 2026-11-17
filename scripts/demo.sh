@@ -84,11 +84,17 @@ for i in 1 2 3; do
 done
 echo "三节点 get foo 全部 OK"
 
-# 杀掉 leader。
+# 杀掉 leader，并等它的进程真正退出再往下走：SIGTERM 是优雅停机，
+# 只 sleep 0.3 秒不等它退出的话，M2 段重启同端口的新进程会绑不上端口
+# （旧进程还没释放），新节点就成了“没 HTTP 的 leader”，demo 会 flake。
 LEADER_NUM="${LEADER_ID#node}"
 kill "${PIDS[$((LEADER_NUM - 1))]}"
+for _ in $(seq 1 50); do
+	kill -0 "${PIDS[$((LEADER_NUM - 1))]}" 2>/dev/null || break
+	sleep 0.1
+done
+kill -0 "${PIDS[$((LEADER_NUM - 1))]}" 2>/dev/null && { echo "FAIL：旧 leader 5 秒内没退出"; exit 1; }
 echo "已杀掉 leader $LEADER_ID，等待新 leader（最多 5 秒）……"
-sleep 0.3
 
 NEW_LEADER_ID=""
 for _ in $(seq 1 25); do
