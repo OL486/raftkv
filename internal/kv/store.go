@@ -124,6 +124,35 @@ func (s *Store) Len() int {
 	return len(s.data)
 }
 
+// Snapshot 返回状态机全量的一份 JSON 拷贝，供 Raft 快照调用。
+// encoding/json 编 map 时 key 按字典序排，所以同样的状态机内容
+// 编出来的字节完全相同（模拟器的确定性、快照对比都靠这一点）。
+// 空状态机编出来是 "{}"，不是空字节——
+// 空字节在快照文件里表示“没有快照”，两者不能混用。
+func (s *Store) Snapshot() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, _ := json.Marshal(s.data)
+	return b
+}
+
+// Restore 用快照数据替换整个状态机（节点启动、安装快照时调）。
+// 数据不是合法 JSON 时返回错误，调用方应拒绝启动、而不是带着
+// 空状态机跑（见 node.New / sim.startNode 的恢复逻辑）。
+func (s *Store) Restore(data []byte) error {
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("快照数据不是合法 JSON：%w", err)
+	}
+	if m == nil {
+		m = make(map[string]string)
+	}
+	s.mu.Lock()
+	s.data = m
+	s.mu.Unlock()
+	return nil
+}
+
 // All 返回全量 key/value 的一份拷贝（模拟器比较各节点状态机用）。
 // 返回的是拷贝，调用方改了也不会影响状态机。
 func (s *Store) All() map[string]string {

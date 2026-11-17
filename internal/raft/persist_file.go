@@ -14,13 +14,19 @@ import (
 )
 
 // FilePersister 是 Persister 的文件实现：持久状态落在 --data 目录下的
-// 两个文件里（格式见 docs/02-persistence.md）：
+// 三个文件里（格式见 docs/02-persistence.md）：
 //
 //   - raft.log：日志文件，追加写。每条 entry 编码为
 //     [term varint][命令长度 varint][命令字节][CRC32 大端 4 字节]，
 //     CRC 覆盖前面三段。写完调 fsync 再返回。
 //   - meta：元数据文件（JSON：currentTerm、votedFor、lastApplied），
 //     每次变化都原子写（临时文件 + fsync + 改名 + fsync 目录）。
+//   - snapshot：快照文件（M5）。内容是状态机全量 + 快照覆盖的
+//     最后一条日志的下标与任期，编码为
+//     [index varint][term varint][数据长度 varint][数据字节][CRC32]，
+//     CRC 覆盖前面四段；同样原子写。日志压缩后，raft.log 的首条目
+//     变成快照位置的占位条目，基底下标只由“日志首条目 + 快照文件”
+//     推导（见 deriveSnapshotBase），meta 里不存它。
 //
 // 写顺序是“先日志、后 meta”：Save 只有在两部分都落盘后才返回，
 // 所以只要 Save 返回了，状态就是稳固的；中途崩溃只会丢掉“还没被
@@ -58,9 +64,11 @@ type FilePersister struct {
 }
 
 const (
-	// logFileName 是日志文件名，metaFileName 是元数据文件名。
-	logFileName  = "raft.log"
-	metaFileName = "meta"
+	// logFileName 是日志文件名，metaFileName 是元数据文件名，
+	// snapshotFileName 是快照文件名。
+	logFileName      = "raft.log"
+	metaFileName     = "meta"
+	snapshotFileName = "snapshot"
 )
 
 // metaFile 是 meta 文件的磁盘格式。
@@ -195,7 +203,12 @@ func (f *FilePersister) saveMetaLocked(s PersistentState) error {
 //   - 日志尾部写一半 / CRC 不对 → 把文件截断到最后一条完整 entry 处，
 //     丢弃写一半的尾巴，不报错（崩溃写一半是预期内的事）。
 //   - 日志与 meta 自相矛盾（lastApplied 指向不存在的下标，
-//     或第一条不是哨兵条目）→ 返回错误，节点拒绝启动。
+//     或第一条不是哨兵/占位条目）→ 返回错误，节点拒绝启动。
+//   - 日志已压缩（首条目是占位条目）→ 读快照文件推导基底
+//     （见 deriveSnapshotBase）：快照文件缺失、损坏、
+//     任期对不上占位条目，都返回错误，节点拒绝启动；
+//     只有快照文件是孤儿时才忽略它——日志未压缩（首条目是哨兵）
+//     说明快照还没生效（写完快照文件、还没重写日志就崩了）。
 //
 // Load 成功后会把读到的状态记为 saved*，这样下次 Save 的差分是准的。
 func (f *FilePersister) Load() (PersistentState, error) {
@@ -210,19 +223,37 @@ func (f *FilePersister) Load() (PersistentState, error) {
 	if err != nil {
 		return PersistentState{}, err
 	}
+	snapIndex, snapTerm := 0, 0
 	if len(log) > 0 {
-		if log[0].Term != 0 || len(log[0].Command) != 0 {
-			return PersistentState{}, fmt.Errorf("日志文件第一条不是哨兵条目（term=%d，命令长 %d），文件可能已损坏", log[0].Term, len(log[0].Command))
+		if len(log[0].Command) != 0 {
+			return PersistentState{}, fmt.Errorf("日志文件第一条不是哨兵/占位条目（term=%d，命令长 %d），文件可能已损坏", log[0].Term, len(log[0].Command))
 		}
-		if meta.LastApplied > len(log)-1 {
-			return PersistentState{}, fmt.Errorf("元数据与日志不一致：lastApplied=%d，但日志只有 %d 条用户条目", meta.LastApplied, len(log)-1)
+		if log[0].Term > 0 {
+			// 占位条目：日志已压缩，读快照文件推导基底。
+			snap, ok, err := f.loadSnapshotLocked()
+			if err != nil {
+				return PersistentState{}, err
+			}
+			snapIndex, snapTerm, err = deriveSnapshotBase(log, snap, ok)
+			if err != nil {
+				return PersistentState{}, err
+			}
+		}
+		// lastApplied 的上界：日志只覆盖到 snapIndex+len(log)-1。
+		// 下界不校验：lastApplied < snapIndex 是合法的中间态——
+		// 快照已落盘、但 apply 循环还没把 lastApplied 推过去就崩了，
+		// NewRaft 会把它钳到 snapIndex（快照本身就是已应用的状态）。
+		if meta.LastApplied > snapIndex+len(log)-1 {
+			return PersistentState{}, fmt.Errorf("元数据与日志不一致：lastApplied=%d，但日志只覆盖到下标 %d", meta.LastApplied, snapIndex+len(log)-1)
 		}
 	}
 	st := PersistentState{
-		CurrentTerm: meta.CurrentTerm,
-		VotedFor:    meta.VotedFor,
-		Log:         log,
-		LastApplied: meta.LastApplied,
+		CurrentTerm:   meta.CurrentTerm,
+		VotedFor:      meta.VotedFor,
+		Log:           log,
+		LastApplied:   meta.LastApplied,
+		SnapshotIndex: snapIndex,
+		SnapshotTerm:  snapTerm,
 	}
 	f.savedLog = append([]LogEntry(nil), log...)
 	f.savedTerm = meta.CurrentTerm
@@ -231,6 +262,115 @@ func (f *FilePersister) Load() (PersistentState, error) {
 	f.savedKnown = true
 	f.logNeedsRewrite = false
 	return st, nil
+}
+
+// SaveMeta 只写 meta 文件（日志文件不动，见 Persister.SaveMeta）。
+func (f *FilePersister) SaveMeta(term int, votedFor string, lastApplied int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveMetaLocked(PersistentState{CurrentTerm: term, VotedFor: votedFor, LastApplied: lastApplied})
+}
+
+// SaveSnapshot 原子写一份快照文件（临时文件 + fsync + 改名 +
+// fsync 目录）。调用方（TakeSnapshot / HandleInstallSnapshot）
+// 保证先写快照文件、再重写日志文件——崩溃窗口的恢复规则见
+// deriveSnapshotBase 与 Load 的注释。
+func (f *FilePersister) SaveSnapshot(snap Snapshot) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(snap.Data) == 0 {
+		return fmt.Errorf("快照数据为空，拒绝保存（空字节在快照文件里表示‘没有快照’）")
+	}
+	if err := atomicWriteFile(f.dir, snapshotFileName, encodeSnapshot(snap)); err != nil {
+		return fmt.Errorf("写快照文件失败：%w", err)
+	}
+	return nil
+}
+
+// LoadSnapshot 读回快照文件。文件不存在时返回 ok=false 与 nil 错误；
+// 文件存在但损坏（长度不够、CRC 不对）时返回错误——
+// 调用方（NewRaft）应拒绝启动，而不是静默用空状态跑。
+func (f *FilePersister) LoadSnapshot() (Snapshot, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loadSnapshotLocked()
+}
+
+// loadSnapshotLocked 读快照文件。调用方持 f.mu。
+func (f *FilePersister) loadSnapshotLocked() (Snapshot, bool, error) {
+	path := filepath.Join(f.dir, snapshotFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Snapshot{}, false, nil // 从未拍过快照
+		}
+		return Snapshot{}, false, fmt.Errorf("读快照文件失败：%w", err)
+	}
+	snap, err := decodeSnapshot(data)
+	if err != nil {
+		return Snapshot{}, false, fmt.Errorf("快照文件损坏：%w", err)
+	}
+	return snap, true, nil
+}
+
+// encodeSnapshot 把一份快照编成磁盘格式：
+// [index varint][term varint][数据长度 varint][数据字节][CRC32 大端 4 字节]，
+// CRC 覆盖前面四段（不含 CRC 自身）。与 encodeLogEntry 同风格。
+func encodeSnapshot(snap Snapshot) []byte {
+	var buf []byte
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(snap.LastIncludedIndex))
+	buf = append(buf, tmp[:n]...)
+	n = binary.PutUvarint(tmp[:], uint64(snap.LastIncludedTerm))
+	buf = append(buf, tmp[:n]...)
+	n = binary.PutUvarint(tmp[:], uint64(len(snap.Data)))
+	buf = append(buf, tmp[:n]...)
+	buf = append(buf, snap.Data...)
+	var crc [4]byte
+	binary.BigEndian.PutUint32(crc[:], crc32.ChecksumIEEE(buf))
+	buf = append(buf, crc[:]...)
+	return buf
+}
+
+// decodeSnapshot 从 data 解一份快照。长度不够或 CRC 不对都返回错误
+// （调用方按“文件损坏”处理：拒绝启动；原子写保证文件要么是旧的
+// 完整内容、要么是新的完整内容，写一半的文件只可能来自磁盘损坏
+// 或外部篡改，不像日志尾巴那样是崩溃的预期结果）。
+func decodeSnapshot(data []byte) (Snapshot, error) {
+	r := bytes.NewReader(data)
+	index, err := binary.ReadUvarint(r)
+	if err != nil {
+		return Snapshot{}, io.ErrUnexpectedEOF
+	}
+	term, err := binary.ReadUvarint(r)
+	if err != nil {
+		return Snapshot{}, io.ErrUnexpectedEOF
+	}
+	dataLen, err := binary.ReadUvarint(r)
+	if err != nil {
+		return Snapshot{}, io.ErrUnexpectedEOF
+	}
+	consumed := len(data) - r.Len()
+	remaining := len(data) - consumed
+	if remaining < 4 || dataLen > uint64(remaining-4) {
+		return Snapshot{}, io.ErrUnexpectedEOF
+	}
+	payload := make([]byte, dataLen)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return Snapshot{}, io.ErrUnexpectedEOF
+	}
+	var crcBytes [4]byte
+	if _, err := io.ReadFull(r, crcBytes[:]); err != nil {
+		return Snapshot{}, io.ErrUnexpectedEOF
+	}
+	n := len(data) - r.Len()
+	if n != len(data) {
+		return Snapshot{}, fmt.Errorf("快照文件有多余的 %d 字节尾巴", len(data)-n)
+	}
+	if crc32.ChecksumIEEE(data[:n-4]) != binary.BigEndian.Uint32(crcBytes[:]) {
+		return Snapshot{}, errors.New("CRC 校验失败")
+	}
+	return Snapshot{LastIncludedIndex: int(index), LastIncludedTerm: int(term), Data: payload}, nil
 }
 
 // loadMetaLocked 读 meta 文件。调用方持 f.mu。

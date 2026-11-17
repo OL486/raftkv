@@ -49,9 +49,13 @@ func (r Role) String() string {
 
 // ApplyMsg 是 Raft 交给状态机的一条已提交命令。
 // 状态机必须按 Index 递增的顺序应用（Raft 保证 applyCh 按序投递）。
+// Snapshot 非空时表示“恢复快照”而不是“应用一条命令”：
+// Command 为空，状态机应把 Snapshot 里的数据整体恢复（见 snapshot.go），
+// Index 是快照覆盖的最后一条日志下标。
 type ApplyMsg struct {
-	Index   int
-	Command []byte
+	Index    int
+	Command  []byte
+	Snapshot []byte
 }
 
 // RequestVoteArgs 是 RequestVote RPC 的参数。
@@ -83,17 +87,27 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  `json:"term"`
 	Success bool `json:"success"`
+	// ConflictIndex 是拒绝时 follower 给的“快速回退”提示（Raft 论文 §5.3）：
+	// follower 日志里第一个与 leader 对不上的下标。
+	// PrevLogIndex 超出 follower 日志时是 lastLogIndex+1；
+	// PrevLogIndex 处任期冲突时，是该冲突任期连续段的第一个下标。
+	// leader 按它直接跳 nextIndex，不用一次一格地试——
+	// M1 的逐格回退在快照场景下太慢（落后 9000 条要 4500 次心跳，
+	// 225 秒，才掉进快照区间，快照追赶根本等不起）。
+	// 0 表示“没有提示”（老版本对端），leader 退回逐格回退。
+	ConflictIndex int `json:"conflict_index,omitempty"`
 }
 
 // DebugInfo 是 /debug/log 返回的节点快照（字段名见 transport 与 node）。
 type DebugInfo struct {
-	ID          string `json:"id"`
-	Term        int    `json:"term"`
-	Role        string `json:"role"`
-	LogLen      int    `json:"logLen"`
-	CommitIndex int    `json:"commitIndex"`
-	LastApplied int    `json:"lastApplied"`
-	Leader      string `json:"leader"`
+	ID            string `json:"id"`
+	Term          int    `json:"term"`
+	Role          string `json:"role"`
+	LogLen        int    `json:"logLen"`
+	CommitIndex   int    `json:"commitIndex"`
+	LastApplied   int    `json:"lastApplied"`
+	Leader        string `json:"leader"`
+	SnapshotIndex int    `json:"snapshotIndex"`
 }
 
 // Raft 是一个 Raft 节点。所有状态都由 mu 保护；
@@ -125,7 +139,19 @@ type Raft struct {
 	votedFor    string
 	// log[0] 是哨兵条目（Term 0，无命令），让日志下标从 1 开始，
 	// 与论文的“日志下标从 1 开始”一致。
+	// 快照（M5）之后 log[0] 变成快照位置的占位条目（Term = 快照任期，
+	// 无命令）：log[i] 是绝对下标 snapshotIndex+i 的条目，
+	// 所有按下标取日志的地方都要减这个基底（见 logTermAtLocked）。
 	log []LogEntry
+	// snapshotIndex 是 log[0] 的绝对下标（0 表示从未快照）；
+	// snapshotTerm 是该位置的任期（即 log[0].Term）；
+	// snapshotData 是该快照的状态机全量（发 InstallSnapshot 时用）。
+	snapshotIndex int
+	snapshotTerm  int
+	snapshotData  []byte
+	// pendingSnap 是已安装、等 apply 循环投递给状态机的快照
+	// （见 snapshot.go 的 pendingSnapshot）。
+	pendingSnap *pendingSnapshot
 
 	// 易失状态。
 	commitIndex int
@@ -220,16 +246,43 @@ func NewRaft(id string, peers []string, addrs map[string]string, transport Trans
 	if err != nil {
 		return nil, fmt.Errorf("恢复持久状态失败：%w", err)
 	}
+	if st.SnapshotIndex > 0 && len(st.Log) == 0 {
+		return nil, fmt.Errorf("恢复的状态不一致：快照下标 %d，但日志为空", st.SnapshotIndex)
+	}
 	if len(st.Log) > 0 {
 		r.currentTerm = st.CurrentTerm
 		r.votedFor = st.VotedFor
 		r.log = append([]LogEntry(nil), st.Log...)
 	}
-	if st.LastApplied > len(r.log)-1 {
-		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只有 %d 条用户条目", st.LastApplied, len(r.log)-1)
+	r.snapshotIndex = st.SnapshotIndex
+	r.snapshotTerm = st.SnapshotTerm
+	if r.snapshotIndex > 0 {
+		// 日志已压缩：快照数据必须在，否则 1..snapshotIndex 的状态丢了。
+		snap, ok, err := persister.LoadSnapshot()
+		if err != nil {
+			return nil, fmt.Errorf("加载快照失败：%w", err)
+		}
+		if !ok {
+			return nil, fmt.Errorf("日志已压缩到下标 %d，但快照文件缺失，没法恢复", r.snapshotIndex)
+		}
+		if snap.LastIncludedIndex != r.snapshotIndex || snap.LastIncludedTerm != r.snapshotTerm {
+			return nil, fmt.Errorf("快照文件与日志基底不一致：快照是（下标 %d，任期 %d），日志基底是（下标 %d，任期 %d）", snap.LastIncludedIndex, snap.LastIncludedTerm, r.snapshotIndex, r.snapshotTerm)
+		}
+		r.snapshotData = snap.Data
 	}
+	// lastApplied 的上界：日志只覆盖到 snapshotIndex+len(log)-1。
+	if st.LastApplied > r.snapshotIndex+len(r.log)-1 {
+		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只覆盖到下标 %d", st.LastApplied, r.snapshotIndex+len(r.log)-1)
+	}
+	// lastApplied < snapshotIndex 是合法的中间态——快照已落盘、
+	// 但 apply 循环还没把 lastApplied 推过去就崩了。
+	// 快照本身就是“1..snapshotIndex 已应用”的状态，钳过去是安全的；
+	// 启动重放时状态机先从快照恢复，再重放快照之后的日志。
 	r.lastApplied = st.LastApplied
-	r.commitIndex = st.LastApplied
+	if r.lastApplied < r.snapshotIndex {
+		r.lastApplied = r.snapshotIndex
+	}
+	r.commitIndex = r.lastApplied
 	return r, nil
 }
 
@@ -273,13 +326,23 @@ func (r *Raft) LeaderID() string {
 	return r.leaderID
 }
 
-// RestoreInfo 返回持久日志的一份拷贝（含下标 0 的哨兵条目）与恢复出来的
-// lastApplied，供 node 层在启动时把 1..lastApplied 的已提交日志
-// 重放到 KV 状态机。
-func (r *Raft) RestoreInfo() ([]LogEntry, int) {
+// RestoreInfo 返回持久日志的一份拷贝、快照与恢复出来的 lastApplied，
+// 供 node 层在启动时恢复状态机：
+//   - 快照非空时先 Store.Restore(snapshot.Data)；
+//   - 再把快照之后、lastApplied 之前的日志按序重放
+//     （下标 i 的条目在 log[i-snapshot.LastIncludedIndex]）。
+//
+// log[0] 是基底位置的占位条目（快照位置、快照任期）或哨兵条目
+// （从未快照时），调用方不要把它当命令重放。
+func (r *Raft) RestoreInfo() ([]LogEntry, Snapshot, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]LogEntry(nil), r.log...), r.lastApplied
+	snap := Snapshot{
+		LastIncludedIndex: r.snapshotIndex,
+		LastIncludedTerm:  r.snapshotTerm,
+		Data:              append([]byte(nil), r.snapshotData...),
+	}
+	return append([]LogEntry(nil), r.log...), snap, r.lastApplied
 }
 
 // LastApplied 返回已应用到状态机的最大日志下标。
@@ -289,28 +352,32 @@ func (r *Raft) LastApplied() int {
 	return r.lastApplied
 }
 
-// Debug 返回 /debug/log 要的快照。LogLen 是用户日志条数（不含哨兵）。
+// Debug 返回 /debug/log 要的快照。LogLen 是快照之后保留的日志条数
+// （不含基底占位条目）；SnapshotIndex 是快照覆盖的最后一条日志下标。
 func (r *Raft) Debug() DebugInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return DebugInfo{
-		ID:          r.id,
-		Term:        r.currentTerm,
-		Role:        r.state.String(),
-		LogLen:      len(r.log) - 1,
-		CommitIndex: r.commitIndex,
-		LastApplied: r.lastApplied,
-		Leader:      r.leaderID,
+		ID:            r.id,
+		Term:          r.currentTerm,
+		Role:          r.state.String(),
+		LogLen:        len(r.log) - 1,
+		CommitIndex:   r.commitIndex,
+		LastApplied:   r.lastApplied,
+		Leader:        r.leaderID,
+		SnapshotIndex: r.snapshotIndex,
 	}
 }
 
-// LogSnapshot 返回日志的一份拷贝（含下标 0 的哨兵条目）与当前的
-// commitIndex、lastApplied。模拟器的不变式检查用它比对各节点日志；
+// LogSnapshot 返回日志的一份拷贝与当前的 commitIndex、lastApplied，
+// 以及日志的基底下标 base（log[0] 是绝对下标 base 的条目；
+// base 为 0 时 log[0] 是哨兵条目，否则是快照位置的占位条目）。
+// 模拟器的不变式检查用它比对各节点日志；
 // 返回的是拷贝，调用方改了也不会影响节点内部状态。
-func (r *Raft) LogSnapshot() ([]LogEntry, int, int) {
+func (r *Raft) LogSnapshot() ([]LogEntry, int, int, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]LogEntry(nil), r.log...), r.commitIndex, r.lastApplied
+	return append([]LogEntry(nil), r.log...), r.snapshotIndex, r.commitIndex, r.lastApplied
 }
 
 // Start 是客户端写入的入口（只在 leader 上有效）。
@@ -335,9 +402,19 @@ func (r *Raft) Start(command []byte) (index, term int, isLeader bool) {
 
 // ---- 内部辅助（调用方必须持 mu，函数名以 Locked 结尾） ----
 
-func (r *Raft) lastLogIndexLocked() int { return len(r.log) - 1 }
+func (r *Raft) lastLogIndexLocked() int { return r.snapshotIndex + len(r.log) - 1 }
 
 func (r *Raft) lastLogTermLocked() int { return r.log[len(r.log)-1].Term }
+
+// logTermAtLocked 返回绝对下标 index 处条目的任期。
+// index == snapshotIndex 时返回快照任期（log[0] 就是占位条目）；
+// index < snapshotIndex 时条目已被压缩掉，返回 ok=false。
+func (r *Raft) logTermAtLocked(index int) (term int, ok bool) {
+	if index < r.snapshotIndex {
+		return 0, false
+	}
+	return r.log[index-r.snapshotIndex].Term, true
+}
 
 // persistLocked 把持久状态写进 Persister（文件实现里写文件 + fsync，
 // 调用点不用改）。
@@ -345,12 +422,30 @@ func (r *Raft) lastLogTermLocked() int { return r.log[len(r.log)-1].Term }
 // 可能丢数据的状态继续服务、回复已经没法保证的写入。
 // 重启后从磁盘恢复，能恢复多少就是多少，不会把“已确认”的写丢了
 // 又装作没事。
+//
+// 注意：这里传给 Save 的 PersistentState 带快照下标与任期，
+// 但 Save 不写它们——基底只由“日志首条目 + 快照文件”决定
+// （见 log.go 的 PersistentState 注释）；
+// 快照数据本身也不在这里写（TakeSnapshot / HandleInstallSnapshot
+// 调 SaveSnapshot 先写快照文件）。
+// persistMetaLocked 只落盘元数据（任期/投票/已应用位置），日志不动。
+// apply 循环专用：应用推进只改 lastApplied，走全量 Save 的话
+// 每次都要把整条日志比一遍、拷一遍（见 Persister.SaveMeta）。
+// 调用方持 r.mu；失败同样 fail-stop。
+func (r *Raft) persistMetaLocked() {
+	if err := r.persister.SaveMeta(r.currentTerm, r.votedFor, r.lastApplied); err != nil {
+		log.Fatalf("节点 %s 持久化元数据失败，停机（避免继续服务却丢数据）：%v", r.id, err)
+	}
+}
+
 func (r *Raft) persistLocked() {
 	st := PersistentState{
-		CurrentTerm: r.currentTerm,
-		VotedFor:    r.votedFor,
-		Log:         append([]LogEntry(nil), r.log...),
-		LastApplied: r.lastApplied,
+		CurrentTerm:   r.currentTerm,
+		VotedFor:      r.votedFor,
+		Log:           append([]LogEntry(nil), r.log...),
+		LastApplied:   r.lastApplied,
+		SnapshotIndex: r.snapshotIndex,
+		SnapshotTerm:  r.snapshotTerm,
 	}
 	if err := r.persister.Save(st); err != nil {
 		log.Fatalf("节点 %s 持久化失败，停机（避免继续服务却丢数据）：%v", r.id, err)
@@ -468,7 +563,9 @@ func (r *Raft) advanceCommitIndexLocked() {
 	}
 	sort.Ints(vals)
 	n := vals[len(vals)/2]
-	if n > r.commitIndex && n <= r.lastLogIndexLocked() && r.log[n].Term == r.currentTerm {
+	// n > commitIndex >= snapshotIndex，所以 n 一定在日志保留范围内，
+	// 减基底取下标是安全的。
+	if n > r.commitIndex && n <= r.lastLogIndexLocked() && r.log[n-r.snapshotIndex].Term == r.currentTerm {
 		r.commitIndex = n
 		r.notifyApplyLocked()
 	}
@@ -591,15 +688,63 @@ func (r *Raft) replicateOnce(peer string, term int) {
 		return
 	}
 	next := r.nextIndex[peer]
+	// follower 落后的程度已经超出 leader 保留的日志
+	// （nextIndex 掉进了快照里）：不再逐条发，改发整个快照。
+	if next <= r.snapshotIndex {
+		args := InstallSnapshotArgs{
+			Term:              r.currentTerm,
+			LeaderID:          r.id,
+			LastIncludedIndex: r.snapshotIndex,
+			LastIncludedTerm:  r.snapshotTerm,
+			Data:              append([]byte(nil), r.snapshotData...),
+		}
+		log.Printf("节点 %s 给 %s 发快照：lastIncludedIndex=%d", r.id, peer, r.snapshotIndex)
+		// 先排好下一次心跳，再发包：对端再慢也不影响心跳节奏。
+		r.scheduleReplicateLocked(peer, HeartbeatInterval, term)
+		r.mu.Unlock()
+
+		addr, ok := r.addrs[peer]
+		if !ok {
+			return
+		}
+		r.transport.InstallSnapshot(addr, &args, func(reply *InstallSnapshotReply, err error) {
+			if err != nil {
+				return // 消息丢了：等下一轮心跳重试
+			}
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.stopped {
+				return
+			}
+			if reply.Term > r.currentTerm {
+				r.stepDownLocked(reply.Term)
+				return
+			}
+			if r.state != Leader || r.currentTerm != args.Term {
+				return // 任期已变，这次回复作废
+			}
+			if reply.Success {
+				if args.LastIncludedIndex > r.matchIndex[peer] {
+					r.matchIndex[peer] = args.LastIncludedIndex
+				}
+				r.nextIndex[peer] = r.matchIndex[peer] + 1
+				r.advanceCommitIndexLocked()
+			}
+			// 失败：nextIndex 不变，下一轮心跳继续发快照重试。
+		})
+		return
+	}
 	args := AppendEntriesArgs{
 		Term:         r.currentTerm,
 		LeaderID:     r.id,
 		PrevLogIndex: next - 1,
-		PrevLogTerm:  r.log[next-1].Term,
+		// next-1 >= snapshotIndex（上面的分支已排除更小的情况），
+		// next-1 == snapshotIndex 时取到的就是占位条目（快照任期）。
+		PrevLogTerm:  r.log[next-1-r.snapshotIndex].Term,
 		LeaderCommit: r.commitIndex,
 	}
 	if next <= r.lastLogIndexLocked() {
-		args.Entries = append([]LogEntry(nil), r.log[next:]...)
+		args.Entries = append([]LogEntry(nil), r.log[next-r.snapshotIndex:]...)
 	}
 	// 先排好下一次心跳，再发包：对端再慢也不影响心跳节奏。
 	r.scheduleReplicateLocked(peer, HeartbeatInterval, term)
@@ -629,9 +774,25 @@ func (r *Raft) replicateOnce(peer string, term int) {
 			r.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 			r.nextIndex[peer] = r.matchIndex[peer] + 1
 			r.advanceCommitIndexLocked()
-		} else if r.nextIndex[peer] > 1 {
+		} else if reply.ConflictIndex > 0 {
+			// 快速回退：按 follower 的提示直接跳 nextIndex
+			// （见 AppendEntriesReply.ConflictIndex）。
+			// 提示落在快照里时压到 snapshotIndex——
+			// 下次心跳改发 InstallSnapshot。
+			// 只往小里跳：过期的回复不能把 nextIndex 往前推
+			// （会跳过 follower 还没确认的条目）。
+			next := reply.ConflictIndex
+			if next <= r.snapshotIndex {
+				next = r.snapshotIndex
+			}
+			if next < r.nextIndex[peer] {
+				r.nextIndex[peer] = next
+			}
+		} else if r.nextIndex[peer] > r.snapshotIndex+1 {
 			// 日志不一致：一次回退一格再试（M1 求简单正确；
 			// 快速回退是 M2 之后的优化，见规划风险 2）。
+			// 下限是 snapshotIndex+1：再往下就是快照里，
+			// 下次心跳改发 InstallSnapshot，不用继续回退。
 			// 下次心跳发的是回退后的位置，不用立刻重发。
 			r.nextIndex[peer]--
 		}
@@ -687,24 +848,54 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	r.armElectionTimerLocked()
 
 	// 一致性检查：PrevLogIndex 处的任期必须与 leader 说的一致。
+	// PrevLogIndex 落在快照里（< snapshotIndex）时跳过检查——
+	// 快照只覆盖已提交的条目，已提交的条目在各节点上一定相同，
+	// 没法也不用再验；PrevLogIndex 恰好是快照位置时验快照任期。
+	// 拒绝时都带 ConflictIndex（快速回退提示，见 AppendEntriesReply）。
 	if args.PrevLogIndex > r.lastLogIndexLocked() {
 		reply.Term = r.currentTerm
+		reply.ConflictIndex = r.lastLogIndexLocked() + 1
 		return reply
 	}
-	if args.PrevLogIndex > 0 && r.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Term = r.currentTerm
-		return reply
+	if args.PrevLogIndex == r.snapshotIndex {
+		if args.PrevLogTerm != r.snapshotTerm {
+			reply.Term = r.currentTerm
+			// 快照任期对不上：leader 只能发 InstallSnapshot 覆盖，
+			// 提示就指回快照位置（leader 看到它会把 nextIndex
+			// 压到 snapshotIndex，下次心跳改发快照）。
+			reply.ConflictIndex = r.snapshotIndex
+			return reply
+		}
+	} else if args.PrevLogIndex > r.snapshotIndex {
+		if r.log[args.PrevLogIndex-r.snapshotIndex].Term != args.PrevLogTerm {
+			reply.Term = r.currentTerm
+			// 任期冲突：回扫到该任期连续段的第一个下标——
+			// leader 从那里重发，一次跳过整个冲突任期，
+			// 而不是一格一格往回试。
+			idx := args.PrevLogIndex - r.snapshotIndex
+			term := r.log[idx].Term
+			for idx > 0 && r.log[idx-1].Term == term {
+				idx--
+			}
+			reply.ConflictIndex = r.snapshotIndex + idx
+			return reply
+		}
 	}
 	// 逐条合入：已有的相同任期条目跳过，冲突条目截断后覆盖，缺的追加。
+	// 下标已在快照里的条目直接跳过（状态机里已有它们的效果）。
 	for i, e := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
+		if idx <= r.snapshotIndex {
+			continue
+		}
+		local := idx - r.snapshotIndex
 		if idx > r.lastLogIndexLocked() {
 			r.log = append(r.log, args.Entries[i:]...)
 			r.persistLocked()
 			break
 		}
-		if r.log[idx].Term != e.Term {
-			r.log = append(r.log[:idx], args.Entries[i:]...)
+		if r.log[local].Term != e.Term {
+			r.log = append(r.log[:local], args.Entries[i:]...)
 			r.persistLocked()
 			break
 		}
@@ -735,23 +926,50 @@ func (r *Raft) runApplyLoop() {
 		}
 		for {
 			r.mu.Lock()
+			// 待投递的快照优先：先把快照交给状态机恢复，
+			// 再应用它之后的日志——顺序不能乱，否则快照之后的
+			// 日志会先于快照被应用，状态机就错了。
+			// 快照投递后 lastApplied 直接跳到快照位置
+			// （快照覆盖的条目不用再逐条投递）。
+			if r.pendingSnap != nil {
+				snap := r.pendingSnap
+				r.pendingSnap = nil
+				// 先落盘 lastApplied、再投递给状态机（顺序不能反）：
+				// 状态机执行完、HTTP 回了 200，客户端就认为这条写稳固了；
+				// 如果先投递后落盘，kill -9 落在两者之间时，
+				// 重启后 lastApplied 还是旧值，快照位置的条目虽然在
+				// 快照文件里，却因图 2 的提交规则（新 leader 不能用
+				// 数人头的方式提交旧任期条目）迟迟进不了状态机，
+				// 客户端刚读到的写就“丢”了。
+				// 先落盘的话，崩溃在落盘与投递之间时，重启从快照恢复
+				// （见 NewRaft 的钳制逻辑），不会丢、也不会多应用。
+				r.lastApplied = snap.index
+				r.persistMetaLocked()
+				r.mu.Unlock()
+				select {
+				case r.applyCh <- ApplyMsg{Index: snap.index, Snapshot: snap.data}:
+				case <-r.done:
+					return
+				}
+				continue
+			}
 			if r.lastApplied >= r.commitIndex {
 				r.mu.Unlock()
 				break
 			}
 			r.lastApplied++
-			msg := ApplyMsg{Index: r.lastApplied, Command: r.log[r.lastApplied].Command}
+			msg := ApplyMsg{Index: r.lastApplied, Command: r.log[r.lastApplied-r.snapshotIndex].Command}
+			// 先落盘 lastApplied、再投递（与快照路径同款理由）：
+			// 注意“投递”不等于“状态机已执行”：崩溃在落盘与投递之间时，
+			// 重启会把这条重放一遍——Put/Delete 都是幂等的，
+			// 多应用一条是安全的；且 lastApplied 永远 ≤ commitIndex，
+			// 重放的绝不会是未提交的尾部日志。
+			// 反过来（先投递后落盘）会在“HTTP 已回 200、lastApplied
+			// 还没落盘”的窗口里丢 durability（M5 测试抓到过）。
+			r.persistMetaLocked()
 			r.mu.Unlock()
 			select {
 			case r.applyCh <- msg:
-				// 已投递给状态机消费端，落盘 lastApplied。
-				// 注意“投递”不等于“状态机已执行”：崩溃在两者之间时，
-				// 重启会把这条重放一遍——Put/Delete 都是幂等的，
-				// 多应用一条是安全的；且 lastApplied 永远 ≤ commitIndex，
-				// 重放的绝不会是未提交的尾部日志。
-				r.mu.Lock()
-				r.persistLocked()
-				r.mu.Unlock()
 			case <-r.done:
 				return
 			}

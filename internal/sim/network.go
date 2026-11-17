@@ -41,6 +41,13 @@ type Network struct {
 	// groups 是当前的分区（每组是一组能互相通信的节点 id）。
 	// nil 表示全连通；Heal() 后恢复成 nil。
 	groups [][]string
+
+	// snapshotDeliveries 是成功投递的 InstallSnapshot 次数
+	// （分区/丢包丢掉的不算）：M5 测试靠它观测“落后 follower
+	// 是不是真的走了快照追赶，而不是逐条复制”。
+	// 只在 Advance 的调用栈里读写，与事件执行同线程，测试在
+	// Advance 返回后读，不用加锁。
+	snapshotDeliveries int
 }
 
 // NewNetwork 建一个模拟网络。rng 是网络专用的 RNG（种子由主种子派生），
@@ -102,6 +109,15 @@ func (t *nodeTransport) RequestVote(addr string, args *raft.RequestVoteArgs, cb 
 func (t *nodeTransport) AppendEntries(addr string, args *raft.AppendEntriesArgs, cb func(*raft.AppendEntriesReply, error)) {
 	t.net.send(t.selfID, addr, func(dst *simNode) {
 		cb(dst.raft.HandleAppendEntries(args), nil)
+	})
+}
+
+// InstallSnapshot 发快照安装请求（异步，回复到了调 cb）。
+// 投递成功时计数（M5 测试的观测点：落后 follower 是不是走了快照追赶）。
+func (t *nodeTransport) InstallSnapshot(addr string, args *raft.InstallSnapshotArgs, cb func(*raft.InstallSnapshotReply, error)) {
+	t.net.send(t.selfID, addr, func(dst *simNode) {
+		t.net.snapshotDeliveries++
+		cb(dst.raft.HandleInstallSnapshot(args), nil)
 	})
 }
 
@@ -198,4 +214,9 @@ func (n *Network) Groups() [][]string {
 		out[i] = append([]string(nil), g...)
 	}
 	return out
+}
+
+// SnapshotDeliveries 返回成功投递的 InstallSnapshot 次数（测试用）。
+func (n *Network) SnapshotDeliveries() int {
+	return n.snapshotDeliveries
 }

@@ -83,3 +83,49 @@ func TestCommand_RoundTrip(t *testing.T) {
 		t.Fatalf("Delete 编解码不对：%+v %v", c, err)
 	}
 }
+
+// TestStore_SnapshotRestore：快照→新状态机恢复→内容完全一致；
+// 恢复坏数据应报错；空状态机的快照是 "{}"，不是空字节。
+func TestStore_SnapshotRestore(t *testing.T) {
+	s := NewStore()
+	if _, err := s.Apply(EncodePut("a", "1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(EncodePut("b", "2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(EncodeDelete("b")); err != nil {
+		t.Fatal(err)
+	}
+	data := s.Snapshot()
+	if len(data) == 0 {
+		t.Fatal("快照不应是空字节")
+	}
+	s2 := NewStore()
+	if err := s2.Restore(data); err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.All(); len(got) != 1 || got["a"] != "1" {
+		t.Fatalf("恢复后内容不对：%v", got)
+	}
+	// 恢复后继续写，不影响原状态机。
+	if _, err := s2.Apply(EncodePut("c", "3")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get("c"); ok {
+		t.Fatal("恢复后的写不应影响原状态机")
+	}
+	// 坏数据拒绝恢复。
+	if err := NewStore().Restore([]byte("not json")); err == nil {
+		t.Fatal("非法 JSON 快照应报错")
+	}
+	// 空状态机快照。
+	if got := NewStore().Snapshot(); string(got) != "{}" {
+		t.Fatalf("空状态机快照应是 {}，实际 %q", got)
+	}
+	// 快照字节是确定的：同样的内容两次编出来必须相同
+	// （模拟器确定性与快照对比都靠这一点）。
+	if string(data) != string(s.Snapshot()) {
+		t.Fatal("同样内容的快照两次编码不一致")
+	}
+}

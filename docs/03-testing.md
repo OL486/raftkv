@@ -72,6 +72,23 @@ M3 的重构只换了“时间”和“传输”的来源，没改 Raft 的决�
   旧 leader 留下的未提交条目，与水位线不同——这是 Raft 允许的，
   迟早会被新 leader 截掉。拿全日志去比会误判成安全破坏。
 
+(b) 与 (c) 的快照适配（M5）：
+
+- 快照把日志截断后，水位线里“已被所有节点压缩掉”的条目就没法再
+  逐条比了——扩展水位线时，找不到条目的下标记成 `unknown` 占位
+  （`LogEntry{Term: -1}`，真实任期 ≥ 0，不会撞上），跳过比较；
+  但快照边界要验“锚点”：某节点快照位置的任期，必须与水位线
+  （或另一个还留着该条目的节点）同一位置的任期一致。
+- (c) 的已应用序列起点不再是下标 1：从快照恢复的节点从
+  `appliedBase = 快照下标` 开始记，应用条数 == `lastApplied - appliedBase`；
+  检查时下标 ≤ 快照位置的条目跳过日志比对（它们的效果已在快照里，
+  日志里没有是正常的——InstallSnapshot 压缩日志后、apply 循环
+  重置追踪前有个小窗口，检查可能恰好落在这里）。
+- 快照触发本身也有时序要求：模拟器的 `consumeApply` 里，
+  **先重置已应用追踪、再拍快照**。反过来会留一个窗口——
+  日志已压缩、`appliedBase` 还是旧值，(c) 拿着旧下标去查已压缩的
+  日志而误报（M5 调试时真实踩到过，见 `sim.go` 的注释）。
+
 ## 故障矩阵（`TestFaultMatrix`）
 
 9 个场景 × 种子 1/2/3 = 27 次运行。每个场景收尾都是：
@@ -320,3 +337,106 @@ concFindLeader → concWaitCommit → concWaitVisible → 下一个操作
   CLI 手动验证：`get --linearizable` 读到最新值、读不存在的 key
   退出 1 并提示不存在、直接调 follower 的 `/kv/read` 返回
   `not_leader` + leader id。
+
+## 快照与日志压缩（M5）
+
+M5 的测试分三层：单元（快照本身）→ 模拟器（100k 写、追赶、重启）
+→ 真实集群（同等验收，写量降到 12k，见下文）。
+
+### 单元测试（`internal/raft/snapshot_test.go`）
+
+- `TestSnapshot_TakeSnapshot_CompactsLog`：拍快照后日志被压缩到
+  快照位置、保留条目变小；旧下标的快照是空操作；
+  超出 `lastApplied` 与空数据的快照报错；持久化 round-trip
+  （新实例 Load 回来的基底与快照数据一致）。
+- `TestSnapshot_InstallSnapshot`：安装新快照压缩日志、推进 commit；
+  旧快照忽略；低任期拒绝；本地该下标任期与快照一致时保留
+  快照之后的条目、不一致时全丢；空数据拒绝安装。
+- `TestSnapshot_PendingDelivery`：安装的快照经 `applyCh` 按序投递——
+  先是快照恢复消息，再是快照之后的日志；`lastApplied` 跳到
+  快照位置后再继续。
+- `TestSnapshot_FilePersister` / `TestSnapshot_MemoryPersister_RoundTrip`：
+  快照文件的 round-trip；损坏的快照文件 Load 拒绝启动；
+  孤儿快照（只写了快照文件、日志没压缩）被 Load 忽略；
+  日志已压缩但快照文件缺失时 Load 拒绝启动；
+  快照文件被截断一半时 LoadSnapshot 报错。
+- `TestAppendEntries_ConflictIndex`：三种拒绝都带快速回退提示
+  （超出日志 / 任期冲突 / 快照任期对不上）；leader 按提示跳
+  `nextIndex`，提示落在快照里时下次心跳改发 InstallSnapshot。
+
+### 模拟器测试（`internal/sim/snapshot_test.go`）
+
+- `TestSnapshot_100kWrites`（核心验收）：流水线写 100k 条
+  （直接调 leader 的 `Start`，不等每条提交——比 `Sim.Put`
+  快一个数量级；顺序写的路径另有 `TestSnapshot_SequentialPuts`
+  覆盖）。断言：三节点快照下标都是 100000、保留日志 0 条、
+  磁盘 `raft.log` 6 字节、快照文件 2.2MB、KV 10 万条全在且三节点
+  一致、不变式通过；写完还能继续写。
+- `TestSnapshot_SequentialPuts`：走正常客户端路径（`Sim.Put`
+  逐条等提交）写 6000 条，快照同样触发（下标 5000，保留 < 5000）。
+- `TestSnapshot_LaggingFollowerInstallSnapshot`：隔离一个 follower，
+  多数派写 9500 条（leader 快照到 5000，落后节点落后 9500 条、
+  超出保留日志），恢复分区，断言 follower 通过 InstallSnapshot
+  追上——观测证据是模拟网络的快照投递计数
+  （`Network.SnapshotDeliveries()`，实测 2 次），
+  不只是最终数据一致（逐条复制也能让数据一致，但它发不出去快照）；
+  落后节点安装的快照下标恰好是 5000（leader 的快照，不是自己拍的）。
+- `TestSnapshot_RestartFromSnapshot`：写 6000 条（快照到 5000），
+  全部 Kill 再 Restart，从快照恢复后数据全在、还能继续写。
+- `TestSnapshot_AppendEntriesAfterSnapshot`：快照之后继续写 100 条，
+  AppendEntries 按绝对下标走（`PrevLogIndex == 快照位置` 时验快照任期），
+  各节点日志收敛、不变式通过。
+
+流水线写的两个注意点（都在 `pipelinePuts` 的注释里）：
+
+- 每 500 条推进 200ms 虚拟时间、每 2000 条检查一次不变式——
+  水位线要及时扩展，否则快照压缩掉的条目就只能记 `unknown` 占位；
+  即使如此，检查之间仍可能有少量条目先被压缩（见不变式一节的锚点规则），
+  那是设计内允许的，不是检查放水。
+- `Advance` 只推进虚拟时钟，apply 循环是真实 goroutine——
+  虚拟时间走完后要 `Settle`（真实时间 drain）等它消费完，
+  否则 `lastApplied` 的断言会在“消息已投递、还没应用”时误报。
+  （M5 调试时真实踩到过：追赶测试里落后节点停在 7483。）
+
+### 真实集群测试（`internal/raft/snapshot_crash_test.go`）
+
+与 `crash_test.go` 共用 `crashCluster`（3 个真实 server 进程，
+端口 18401–18403）。两个注意点：
+
+- **写量降到 12k / 9k，不是 100k**：HTTP 逐条写 100k 在本机实测
+  约 0.95–1.7ms/条，要 95–170 秒——太慢。
+  12k 已远超快照阈值（5000），足以验证“快照触发→落盘→重启恢复”
+  整条链路；100k 的量级由模拟器测试覆盖。报告里写清楚各跑了多少，
+  不许悄悄把验收数字改小。
+- **重启恢复的抽查走线性化读 `/kv/read`**，不用 `/kv/get`——
+  后者可能读到落后副本的旧数据，造成误判。
+- `TestSnapshot_RestartFromSnapshot_RealCluster`：写 12000 条，
+  kill -9 全部节点再重启，随机抽 100 个 key 线性化读全部正确，
+  再写 5 条验证集群还能工作。
+- `TestSnapshot_LaggingFollowerInstallSnapshot_RealCluster`：
+  杀掉一个 follower，多数派写 9000 条，重启 follower，
+  断言它通过 InstallSnapshot 追上——观测证据是两边的日志行
+  （leader 的“给 X 发快照”与 follower 的“安装快照”，下标都是 5000），
+  不是只看最终数据一致。
+
+### M5 实测记录（2026-11-17，本机）
+
+- `go vet ./...` 全绿；`gofmt -l .` 为空；`make check` 与 `make sim`
+  通过；`scripts/demo.sh` 仍通过。
+- `go test ./... -count=1 -race`：**60 个顶层测试全绿**（M4 的 46 个
+  一个不少 + M5 新增 14 个：kv 快照 1 个、raft 快照单元 5 个 +
+  快速回退 1 个、模拟器 5 个、真实集群 2 个）。
+  全量 `-race` 一次约 5 分半，其中 100k 测试占约 2 分半。
+- 模拟器 100k 写：27 秒（没加 `SaveMeta` 之前 65 秒）；
+  顺序写 6000 条：8.6 秒。
+- 真实集群：12000 条写 20.9 秒，重启后 100 个随机 key 全对；
+  落后追赶 9000 条写 17.2 秒，快照投递观测到。
+- M5 测试还抓到两个旧问题并顺手修了：
+  `runApplyLoop` 的落盘顺序从“先投递后落盘”改成“先落盘再投递”
+  （见“重启重放”一节——`TestCrashRestart_WriteInFlight` 在
+  `-race` 整套跑时因此失败过，修后连跑 5 次全过）；
+  `TestRandomFaultLong_Performance` 的 10 秒上限按非 race 标定，
+  `-race` 下检测器本身的开销就能把它顶到 10.4 秒
+  （不带 `-race` 只要 0.6 秒，无回归），
+  上限改成构建标签区分：非 race 10 秒，`-race` 30 秒
+  （`internal/sim/perf_race.go` / `perf_norace.go`）。

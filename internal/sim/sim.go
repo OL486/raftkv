@@ -49,6 +49,11 @@ type simNode struct {
 
 	appliedMu sync.Mutex
 	applied   []appliedEntry
+	// appliedBase 是已应用序列的起点：applied[0] 的下标是 appliedBase+1。
+	// 平时是 0（applied 从下标 1 开始）；节点从快照恢复或安装快照后，
+	// applied 被重置，快照位置之前的条目不再逐条记录，
+	// appliedBase 就是快照下标（见 consumeApply 与 startNode）。
+	appliedBase int
 	// results 是下标 -> 应用结果（kv.ApplyResult 的 JSON），
 	// consumeApply 与启动重放时记下；Sim.Read 靠它拿读命令
 	// 在日志里应用那一刻的值（线性化点处的值）。
@@ -64,13 +69,34 @@ func (n *simNode) appliedCopy() []appliedEntry {
 	return out
 }
 
+// appliedStatus 返回已应用序列的起点与条数（不变式 (c) 与 drain 用）。
+func (n *simNode) appliedStatus() (base, length int) {
+	n.appliedMu.Lock()
+	defer n.appliedMu.Unlock()
+	return n.appliedBase, len(n.applied)
+}
+
 // consumeApply 是 apply 循环的消费端（node.consumeApply 的模拟器版）：
 // 把已提交命令按序交给状态机，并记下应用顺序供不变式 (c) 检查。
+// 快照消息（msg.Snapshot 非空）表示“恢复快照”：
+// 恢复状态机，并把已应用序列重置到快照位置——
+// 快照位置之前的条目不再逐条记录（它们的效果已在快照里），
+// 之后的条目继续按序追加。
 func (n *simNode) consumeApply() {
 	defer n.wg.Done()
 	for {
 		select {
 		case msg := <-n.applyCh:
+			if msg.Snapshot != nil {
+				if err := n.store.Restore(msg.Snapshot); err != nil {
+					panic(fmt.Sprintf("节点 %s 恢复快照 %d 失败：%v", n.id, msg.Index, err))
+				}
+				n.appliedMu.Lock()
+				n.applied = nil
+				n.appliedBase = msg.Index
+				n.appliedMu.Unlock()
+				continue
+			}
 			result, err := n.store.Apply(msg.Command)
 			if err != nil {
 				// 日志里的命令都是合法的，出错即是 bug：记下来，
@@ -84,6 +110,24 @@ func (n *simNode) consumeApply() {
 			}
 			n.results[msg.Index] = result
 			n.appliedMu.Unlock()
+			// 快照触发（与 node.consumeApply 同款逻辑）：
+			// 自上次快照以来已应用的条目达到阈值，就拍一次快照。
+			// 顺序很关键：先重置已应用追踪，再拍快照。
+			// 拍快照会压缩日志；若先拍后重置，中间的窗口里
+			// 不变式 (c) 会看到“日志已压缩、appliedBase 还是旧值”，
+			// 拿着旧下标去查已压缩的日志而误报。
+			// 先重置则窗口里 appliedBase == lastApplied == msg.Index，
+			// 不变式无事可查；TakeSnapshot 失败时本节点直接 panic，
+			// 不存在“追踪丢了、快照没拍”的中间态。
+			if msg.Index-n.raft.SnapshotIndex() >= raft.SnapshotThreshold {
+				n.appliedMu.Lock()
+				n.applied = nil
+				n.appliedBase = msg.Index
+				n.appliedMu.Unlock()
+				if err := n.raft.TakeSnapshot(msg.Index, n.store.Snapshot()); err != nil {
+					panic(fmt.Sprintf("节点 %s 拍快照 %d 失败：%v", n.id, msg.Index, err))
+				}
+			}
 		case <-n.done:
 			return
 		}
@@ -190,15 +234,23 @@ func (s *Sim) startNode(id string, idx int, restarts int) error {
 		restarts: restarts,
 		rng:      rng,
 	}
-	// 启动恢复：重放已应用的日志（只到 lastApplied——之后的条目
-	// 等新 leader 的心跳带 LeaderCommit 过来后再正常应用）。
-	logEntries, lastApplied := r.RestoreInfo()
-	for i := 1; i <= lastApplied; i++ {
-		result, err := n.store.Apply(logEntries[i].Command)
+	// 启动恢复：先从快照恢复状态机（快照覆盖 1..snapshotIndex），
+	// 再重放快照之后、lastApplied 之前的日志（下标 i 的条目在
+	// logEntries[i-snapshotIndex]）。重放的条目记进 applied，
+	// 起点就是快照下标（不变式 (c) 按 appliedBase 核对顺序）。
+	logEntries, snapshot, lastApplied := r.RestoreInfo()
+	if snapshot.LastIncludedIndex > 0 {
+		if err := n.store.Restore(snapshot.Data); err != nil {
+			return fmt.Errorf("节点 %s 从快照恢复失败：%w", id, err)
+		}
+		n.appliedBase = snapshot.LastIncludedIndex
+	}
+	for i := snapshot.LastIncludedIndex + 1; i <= lastApplied; i++ {
+		result, err := n.store.Apply(logEntries[i-snapshot.LastIncludedIndex].Command)
 		if err != nil {
 			return fmt.Errorf("节点 %s 重放日志 %d 失败：%w", id, i, err)
 		}
-		n.applied = append(n.applied, appliedEntry{index: i, command: append([]byte(nil), logEntries[i].Command...)})
+		n.applied = append(n.applied, appliedEntry{index: i, command: append([]byte(nil), logEntries[i-snapshot.LastIncludedIndex].Command...)})
 		if n.results == nil {
 			n.results = make(map[int][]byte)
 		}
@@ -262,7 +314,10 @@ func (s *Sim) drain() error {
 				continue
 			}
 			dbg := n.raft.Debug()
-			if len(n.appliedCopy()) != dbg.LastApplied || dbg.LastApplied != dbg.CommitIndex {
+			// 已应用条数 == lastApplied - appliedBase：
+			// 从快照恢复的节点，applied 只从快照位置开始记。
+			base, appliedLen := n.appliedStatus()
+			if appliedLen != dbg.LastApplied-base || dbg.LastApplied != dbg.CommitIndex {
 				done = false
 				break
 			}

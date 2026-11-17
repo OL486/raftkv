@@ -90,10 +90,12 @@ func assertAllKVEqual(t *testing.T, sim *Sim) {
 
 // assertAllLogsEqual 断言所有活节点的已提交日志完全相同
 // （逐条比较 term+命令，含第 0 条哨兵；以第一个活节点为准）。
-// 只比较已提交前缀（下标 ≤ 各节点的 commitIndex），不比较
+// 只比较已提交前缀（下标 ≤ commitIndex），不比较
 // 未提交的尾部——follower 可能留着 leader 没有的旧尾巴，
 // Raft 不保证它被截掉（leader 只发自己有的条目，空心跳不会
 // 截掉 follower 多出来的尾巴；要等下一次写才会被覆盖）。
+// 快照（M5）之后：只比较双方都保留着的下标，
+// 快照位置的任期用“锚点”核对（见 logsDivergence）。
 func assertAllLogsEqual(t *testing.T, sim *Sim) {
 	t.Helper()
 	if msg := logsDivergence(sim); msg != "" {
@@ -131,26 +133,46 @@ func logsEqual(sim *Sim) bool {
 // 一致时返回 ""。
 func logsDivergence(sim *Sim) string {
 	var want []raft.LogEntry
+	var wantBase int
 	wantCommit := -1
 	for _, id := range sim.IDs() {
 		if !sim.Alive(id) {
 			continue
 		}
-		log, commit, _ := sim.nodes[id].raft.LogSnapshot()
+		log, base, commit, _ := sim.nodes[id].raft.LogSnapshot()
 		if wantCommit < 0 {
-			wantCommit, want = commit, log
+			wantCommit, want, wantBase = commit, log, base
 			continue
 		}
 		if commit != wantCommit {
 			return fmt.Sprintf("节点 %s commitIndex=%d，第一个节点是 %d", id, commit, wantCommit)
 		}
-		if len(log)-1 < commit {
-			return fmt.Sprintf("节点 %s 日志只有 %d 条，commitIndex 却到 %d", id, len(log)-1, commit)
+		if base+len(log)-1 < commit {
+			return fmt.Sprintf("节点 %s 日志只覆盖到下标 %d，commitIndex 却到 %d", id, base+len(log)-1, commit)
 		}
-		for i := 1; i <= commit; i++ {
-			if log[i].Term != want[i].Term || !bytes.Equal(log[i].Command, want[i].Command) {
+		// 快照边界锚点：该节点快照位置的任期，必须与第一个节点
+		// 同一下标的条目任期一致（若第一个节点还留着它）。
+		if base > wantBase && base-wantBase < len(want) {
+			if log[0].Term != want[base-wantBase].Term {
+				return fmt.Sprintf("节点 %s 快照下标 %d 任期是 %d，第一个节点同一下标是 %d",
+					id, base, log[0].Term, want[base-wantBase].Term)
+			}
+		}
+		if wantBase > base && wantBase-base < len(log) {
+			if want[0].Term != log[wantBase-base].Term {
+				return fmt.Sprintf("第一个节点快照下标 %d 任期是 %d，节点 %s 同一下标是 %d",
+					wantBase, want[0].Term, id, log[wantBase-base].Term)
+			}
+		}
+		// 只比较双方都保留着的已提交前缀。
+		lo := base
+		if wantBase > lo {
+			lo = wantBase
+		}
+		for i := lo + 1; i <= commit; i++ {
+			if log[i-base].Term != want[i-wantBase].Term || !bytes.Equal(log[i-base].Command, want[i-wantBase].Command) {
 				return fmt.Sprintf("节点 %s 已提交日志下标 %d 是 {%d,%q}，第一个节点是 {%d,%q}",
-					id, i, log[i].Term, log[i].Command, want[i].Term, want[i].Command)
+					id, i, log[i-base].Term, log[i-base].Command, want[i-wantBase].Term, want[i-wantBase].Command)
 			}
 		}
 	}

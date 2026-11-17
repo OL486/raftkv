@@ -6,12 +6,14 @@
 客户端写一条 Put，要经过选主、日志复制、多数派提交、按序应用到状态机，
 三个节点的 KV 内容最终一致；杀掉一个节点（甚至杀掉 leader）服务不中断。
 
-## 当前状态：M4（线性一致性检查）
+## 当前状态：M5（快照与日志压缩）——全部里程碑完成
 
 能跑的：
 
 - 选主（随机选举超时 150–300ms，心跳 50ms）
-- 日志复制（AppendEntries + 一致性检查 + 冲突截断，一次回退一格）
+- 日志复制（AppendEntries + 一致性检查 + 冲突截断 + 快速回退
+  `ConflictIndex`：follower 告诉 leader 它日志里第一个对不上的下标，
+  leader 直接跳过去，不用一次一格地试）
 - 提交（matchIndex 中位数，限当前任期条目）
 - KV 的 Put / Get（Delete 已在状态机与命令层实现，HTTP/CLI 暂不暴露）
 - `curl` 看集群状态：`GET /debug/log`
@@ -20,6 +22,15 @@
   （`currentTerm` / `votedFor` / `lastApplied` 的 JSON，原子写）；
   kill -9 后重启，term 与日志全在，数据不丢；写一半的尾巴自动截断丢弃。
   详见 `docs/02-persistence.md`。
+- **快照与日志压缩**：每应用 5000 条拍一次快照（状态机全量 JSON +
+  `lastIncludedIndex` / `lastIncludedTerm` + CRC32，原子写进
+  `snapshot` 文件），日志截断到快照位置，稳态保留 0–4999 条；
+  落后太多的 follower 靠 `InstallSnapshot` 追赶；
+  重启时先从快照恢复、再重放快照之后的日志；
+  损坏/缺失的快照拒绝启动（fail-stop），绝不静默空跑。
+  实测：模拟器写 100k 条后三节点快照下标 100000、保留日志 0 条、
+  磁盘 `raft.log` 仅 6 字节；真实集群写 12000 条、kill -9 全杀再重启，
+  随机抽 100 个 key 线性化读全部正确。详见 `docs/02-persistence.md`。
 - **确定性模拟器**：三个 Raft 实例跑在同一个进程里，虚拟时钟 +
   模拟网络（可编程丢包、延迟、分区）+ 随机故障注入（分区、杀节点、
   重启、写请求）；每步检查三个不变式（同一任期最多一个 leader、
@@ -32,13 +43,10 @@
   线性一致；真实三节点集群的 smoke 测试也通过。
   两条读路径的语义差异见 `docs/03-testing.md` 的 M4 一节。
 
-不能跑的（按规划，后面里程碑做）：
+不能跑的（按规划，明确不做）：
 
-- 快照与日志压缩（M5）：日志只增不减，写 10 万条后 `raft.log` 就是
-  10 万条的量，启动时全量读回；每条写都 fsync、每次应用都写 meta，
-  写吞吐不高——这是 M2 的设计取舍。
 - 动态加节点、Pre-Vote、ReadIndex 读优化、TLS、WATCH、跨 key 事务：
-  明确不做，见 `~/workspace/tech-project-plans.md` 项目 3 的不做清单。
+  见 `~/workspace/tech-project-plans.md` 项目 3 的不做清单。
 
 ## 快速开始
 
@@ -53,7 +61,7 @@ make run
 
 # 看某个节点的 Raft 状态
 curl -s localhost:8001/debug/log
-# {"id":"node1","term":3,"role":"leader","logLen":2,"commitIndex":2,"lastApplied":2,"leader":"node1"}
+# {"id":"node1","term":3,"role":"leader","logLen":2,"commitIndex":2,"lastApplied":2,"leader":"node1","snapshotIndex":0}
 ```
 
 想看完整流程（含杀 leader、选新 leader、kill -9 后重启恢复）直接跑演示：

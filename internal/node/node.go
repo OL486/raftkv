@@ -82,14 +82,23 @@ func New(cfg *cluster.Config, id string, dataDir string) (*Node, error) {
 		applyCh: applyCh,
 		done:    make(chan struct{}),
 	}
-	// 启动恢复：重放已应用的日志。重放失败说明磁盘上的命令已损坏，
-	// 拒绝启动比带着错数据跑要安全。
-	logEntries, lastApplied := r.RestoreInfo()
-	if lastApplied > len(logEntries)-1 {
-		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只有 %d 条用户条目", lastApplied, len(logEntries)-1)
+	// 启动恢复：先从快照恢复状态机（快照覆盖 1..snapshotIndex），
+	// 再把快照之后、lastApplied 之前的日志按序重放
+	// （下标 i 的条目在 logEntries[i-snapshotIndex]）。
+	// 只重放到 lastApplied——之后的条目等新 leader 的心跳带
+	// LeaderCommit 过来后，再由 apply 循环正常应用。
+	logEntries, snapshot, lastApplied := r.RestoreInfo()
+	if snapshot.LastIncludedIndex > 0 {
+		if err := n.store.Restore(snapshot.Data); err != nil {
+			return nil, fmt.Errorf("从快照恢复状态机失败：%w", err)
+		}
+		log.Printf("节点 %s 从快照恢复：快照下标 %d，状态机 %d 条", id, snapshot.LastIncludedIndex, n.store.Len())
 	}
-	for i := 1; i <= lastApplied; i++ {
-		if _, err := n.store.Apply(logEntries[i].Command); err != nil {
+	if lastApplied > snapshot.LastIncludedIndex+len(logEntries)-1 {
+		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只覆盖到下标 %d", lastApplied, snapshot.LastIncludedIndex+len(logEntries)-1)
+	}
+	for i := snapshot.LastIncludedIndex + 1; i <= lastApplied; i++ {
+		if _, err := n.store.Apply(logEntries[i-snapshot.LastIncludedIndex].Command); err != nil {
 			return nil, fmt.Errorf("重放日志 %d 失败：%w", i, err)
 		}
 	}
@@ -134,10 +143,20 @@ func (n *Node) Store() *kv.Store { return n.store }
 
 // consumeApply 是 apply 循环的消费端：把已提交命令按序交给状态机，
 // 再通知等这条日志的 /kv/put（只等通知）与 /kv/read（拿应用结果）。
+// 快照消息（msg.Snapshot 非空）表示“恢复快照”而不是“应用一条命令”：
+// 先恢复状态机，再继续应用快照之后的日志——顺序由 applyCh 保证。
 func (n *Node) consumeApply() {
 	for {
 		select {
 		case msg := <-n.applyCh:
+			if msg.Snapshot != nil {
+				if err := n.store.Restore(msg.Snapshot); err != nil {
+					log.Printf("节点 %s 恢复快照 %d 失败：%v", n.ID, msg.Index, err)
+				} else {
+					log.Printf("节点 %s 从快照恢复：下标 %d，状态机 %d 条", n.ID, msg.Index, n.store.Len())
+				}
+				continue
+			}
 			// 状态机出错只记日志：日志里的命令都是合法的，
 			// 出错即是 bug，不应让整个节点停下。
 			result, err := n.store.Apply(msg.Command)
@@ -160,6 +179,15 @@ func (n *Node) consumeApply() {
 				delete(n.waiters, msg.Index)
 			}
 			n.mu.Unlock()
+			// 快照触发：自上次快照以来已应用的条目达到阈值，
+			// 就拍一次快照、把日志压缩到刚应用的位置。
+			// 只压缩已应用的条目——msg.Index 就是刚应用的下标，
+			// Store.Snapshot() 取的正是 1..msg.Index 的状态。
+			if msg.Index-n.raft.SnapshotIndex() >= raft.SnapshotThreshold {
+				if err := n.raft.TakeSnapshot(msg.Index, n.store.Snapshot()); err != nil {
+					log.Printf("节点 %s 拍快照 %d 失败：%v", n.ID, msg.Index, err)
+				}
+			}
 		case <-n.done:
 			return
 		}

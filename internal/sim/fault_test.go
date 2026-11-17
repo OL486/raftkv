@@ -79,7 +79,7 @@ func TestRandomFaultLong_Performance(t *testing.T) {
 	_, _, _ = runFaultLong(t, 99, 1000)
 	elapsed := time.Since(start)
 	t.Logf("1000 步随机长跑耗时 %v", elapsed)
-	if elapsed > 10*time.Second {
-		t.Fatalf("1000 步耗时 %v，超过 10 秒上限", elapsed)
+	if elapsed > perfBudget {
+		t.Fatalf("1000 步耗时 %v，超过 %v 上限", elapsed, perfBudget)
 	}
 }
