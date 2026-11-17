@@ -3,11 +3,13 @@
 // 用法：
 //
 //	raftkv-cli --config cluster.json put foo bar   # 写
-//	raftkv-cli --config cluster.json get foo        # 读
+//	raftkv-cli --config cluster.json get foo        # 读（可能读旧）
+//	raftkv-cli --config cluster.json get --linearizable foo  # 线性化读
 //
 // 客户端先随便连一个节点，收到 NotLeader 就按提示重定向到 leader；
 // leader 挂了就重试下一个节点，直到超时报错。
-// 注意 get 读的是所连节点的本地状态机，读 follower 可能读到旧数据。
+// 注意 get 读的是所连节点的本地状态机，读 follower 可能读到旧数据；
+// 要线性化的最新值用 get --linearizable（走 Raft 日志的读命令）。
 package main
 
 import (
@@ -53,11 +55,27 @@ func main() {
 		}
 		fmt.Println("OK")
 	case "get":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "用法：raftkv-cli get <key>")
+		// get [--linearizable] <key>：--linearizable 走 /kv/read（日志读命令）。
+		linearizable := false
+		var rest []string
+		for _, a := range args[1:] {
+			if a == "--linearizable" {
+				linearizable = true
+			} else {
+				rest = append(rest, a)
+			}
+		}
+		if len(rest) != 1 {
+			fmt.Fprintln(os.Stderr, "用法：raftkv-cli get [--linearizable] <key>")
 			os.Exit(1)
 		}
-		value, err := doGet(client, cfg, args[1], deadline)
+		var value string
+		var err error
+		if linearizable {
+			value, err = doGetLinearizable(client, cfg, rest[0], deadline)
+		} else {
+			value, err = doGet(client, cfg, rest[0], deadline)
+		}
 		if err != nil {
 			fatal(err)
 		}
@@ -72,7 +90,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "用法：")
 	fmt.Fprintln(os.Stderr, "  raftkv-cli --config cluster.json put <key> <value>")
-	fmt.Fprintln(os.Stderr, "  raftkv-cli --config cluster.json get <key>")
+	fmt.Fprintln(os.Stderr, "  raftkv-cli --config cluster.json get [--linearizable] <key>")
 }
 
 func fatal(err error) {
@@ -158,4 +176,56 @@ func doGet(client *http.Client, cfg *cluster.Config, key string, deadline time.T
 		time.Sleep(100 * time.Millisecond)
 	}
 	return "", fmt.Errorf("key %q 不存在（或集群不可用）", key)
+}
+
+// readResponse 是 /kv/read 的回复形状：成功时是 key/value/found，
+// 不是 leader 时是 error=not_leader + leader（与 putResponse 同款）。
+type readResponse struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Found  bool   `json:"found"`
+	Error  string `json:"error,omitempty"`
+	Leader string `json:"leader,omitempty"`
+}
+
+// doGetLinearizable 是线性化读：POST /kv/read，走 Raft 日志的读命令，
+// 返回读命令在日志里应用那一刻的值。不是 leader 时按 NotLeader
+// 重定向（与 doPut 同款）；key 不存在时返回错误。
+func doGetLinearizable(client *http.Client, cfg *cluster.Config, key string, deadline time.Time) (string, error) {
+	nodes := cfg.Nodes
+	next := 0
+	for time.Now().Before(deadline) {
+		n := nodes[next%len(nodes)]
+		next++
+		body, _ := json.Marshal(map[string]string{"key": key})
+		resp, err := client.Post("http://"+n.Addr+"/kv/read", "application/json", bytes.NewReader(body))
+		if err != nil {
+			continue // 节点不通，试下一个
+		}
+		var rr readResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&rr)
+		resp.Body.Close()
+		if decodeErr != nil {
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			if !rr.Found {
+				return "", fmt.Errorf("key %q 不存在", key)
+			}
+			return rr.Value, nil
+		}
+		if rr.Error == "not_leader" && rr.Leader != "" {
+			// 按提示重定向到 leader。
+			for i, cand := range nodes {
+				if cand.ID == rr.Leader {
+					next = i
+					break
+				}
+			}
+			continue
+		}
+		// 超时或其他错误：等一小会儿再试下一个节点。
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "", fmt.Errorf("线性化读 key %q 超时：集群里没有可用的 leader", key)
 }

@@ -49,6 +49,10 @@ type simNode struct {
 
 	appliedMu sync.Mutex
 	applied   []appliedEntry
+	// results 是下标 -> 应用结果（kv.ApplyResult 的 JSON），
+	// consumeApply 与启动重放时记下；Sim.Read 靠它拿读命令
+	// 在日志里应用那一刻的值（线性化点处的值）。
+	results map[int][]byte
 }
 
 // appliedCopy 返回已应用序列的一份拷贝。
@@ -67,13 +71,18 @@ func (n *simNode) consumeApply() {
 	for {
 		select {
 		case msg := <-n.applyCh:
-			if err := n.store.Apply(msg.Command); err != nil {
+			result, err := n.store.Apply(msg.Command)
+			if err != nil {
 				// 日志里的命令都是合法的，出错即是 bug：记下来，
 				// 不让整个节点停下（测试失败时再从这里查）。
 				panic(fmt.Sprintf("节点 %s 应用日志 %d 失败：%v", n.id, msg.Index, err))
 			}
 			n.appliedMu.Lock()
 			n.applied = append(n.applied, appliedEntry{index: msg.Index, command: append([]byte(nil), msg.Command...)})
+			if n.results == nil {
+				n.results = make(map[int][]byte)
+			}
+			n.results[msg.Index] = result
 			n.appliedMu.Unlock()
 		case <-n.done:
 			return
@@ -185,10 +194,15 @@ func (s *Sim) startNode(id string, idx int, restarts int) error {
 	// 等新 leader 的心跳带 LeaderCommit 过来后再正常应用）。
 	logEntries, lastApplied := r.RestoreInfo()
 	for i := 1; i <= lastApplied; i++ {
-		if err := n.store.Apply(logEntries[i].Command); err != nil {
+		result, err := n.store.Apply(logEntries[i].Command)
+		if err != nil {
 			return fmt.Errorf("节点 %s 重放日志 %d 失败：%w", id, i, err)
 		}
 		n.applied = append(n.applied, appliedEntry{index: i, command: append([]byte(nil), logEntries[i].Command...)})
+		if n.results == nil {
+			n.results = make(map[int][]byte)
+		}
+		n.results[i] = result
 	}
 	s.net.Register(id, addr, n)
 	s.nodes[id] = n
@@ -413,6 +427,80 @@ func (s *Sim) waitVisible(index int) (int, error) {
 		return 0, err
 	}
 	return index, nil
+}
+
+// Read 是线性化读：把 Read 命令走 Raft 日志（与 Put 同样的提交路径），
+// 返回它在日志里应用那一刻的值。实现复用 tryPut/waitVisible：
+// Read 命令在状态机里是 no-op，所以重试（多追加一条读命令）
+// 不会弄脏 KV；返回的值取自应用结果记录，不是事后读 Store，
+// 事后读可能读到更晚的 Put。
+func (s *Sim) Read(key string) (string, bool, error) {
+	cmd := kv.EncodeRead(key)
+	index, leaderID, committed := s.tryPut(cmd, 2*time.Second)
+	if committed {
+		if _, err := s.waitVisible(index); err != nil {
+			return "", false, err
+		}
+		return s.readResult(index)
+	}
+	if index == 0 {
+		// 连 leader 都没找到（或 Start 被拒）：读根本没开始。
+		return "", false, fmt.Errorf("读 %q：5 秒虚拟时间内没有可用的 leader", key)
+	}
+	// 第一次没提交：看 leader 是不是换人了。
+	if l2 := s.findLeader(); l2 != nil && l2.id != leaderID {
+		if index2, _, committed2 := s.tryPut(cmd, putCommitWait); committed2 {
+			if _, err := s.waitVisible(index2); err != nil {
+				return "", false, err
+			}
+			return s.readResult(index2)
+		}
+		return "", false, fmt.Errorf("读 %q 在新 leader %s 上 10 秒虚拟时间内也没提交", key, l2.id)
+	}
+	// leader 没换：继续等第一条提交满 10 秒。
+	for waited := 2 * time.Second; waited < putCommitWait; waited += putAdvanceStep {
+		s.Advance(putAdvanceStep)
+		if s.maxCommitIndex() >= index {
+			if _, err := s.waitVisible(index); err != nil {
+				return "", false, err
+			}
+			return s.readResult(index)
+		}
+	}
+	return "", false, fmt.Errorf("读 %q（下标 %d）10 秒虚拟时间内没提交", key, index)
+}
+
+// readResult 从任一活节点取下标 index 的应用结果
+// （各节点按序应用同一条日志，同一位置的结果相同）。
+// waitVisible 已保证该下标被应用，找不到结果即是 bug。
+func (s *Sim) readResult(index int) (string, bool, error) {
+	res := s.AppliedResult(index)
+	if res == nil {
+		return "", false, fmt.Errorf("下标 %d 已提交但没有节点记下应用结果", index)
+	}
+	ar, err := kv.DecodeApplyResult(res)
+	if err != nil {
+		return "", false, err
+	}
+	return ar.Value, ar.Found, nil
+}
+
+// AppliedResult 返回下标 index 的应用结果（任一活节点记下的），
+// 没有活节点应用过该下标时返回 nil。
+func (s *Sim) AppliedResult(index int) []byte {
+	for _, id := range s.ids {
+		n := s.nodes[id]
+		if n == nil || !n.alive {
+			continue
+		}
+		n.appliedMu.Lock()
+		res, ok := n.results[index]
+		n.appliedMu.Unlock()
+		if ok {
+			return res
+		}
+	}
+	return nil
 }
 
 // Get 读某节点的本地状态机（可能读到旧数据，与真实节点一致）。

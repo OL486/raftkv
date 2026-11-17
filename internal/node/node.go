@@ -28,8 +28,16 @@ type Node struct {
 	store *kv.Store
 	srv   *http.Server
 
-	mu      sync.Mutex
-	waiters map[int]chan struct{} // 等某条日志被应用的 waiter（下标 -> 通知 channel）
+	mu sync.Mutex
+	// waiters 是等某条日志被应用的 waiter（下标 -> 通知 channel）：
+	// channel 里传的是那条日志的应用结果（kv.ApplyResult 的 JSON），
+	// /kv/put 不关心结果、只等通知，/kv/read 靠它拿线性化点处的值。
+	waiters map[int]chan []byte
+	// results 是最近应用过的日志下标 -> 应用结果（只留最近 1024 条）。
+	// 读命令刚追加就可能已被应用（注册 waiter 之前），
+	// 这时从缓存里拿结果——结果是在应用那一刻记下的，
+	// 所以是这条读命令的线性化点处的值，不会被之后的写污染。
+	results map[int][]byte
 
 	applyCh  chan raft.ApplyMsg
 	done     chan struct{}
@@ -69,7 +77,8 @@ func New(cfg *cluster.Config, id string, dataDir string) (*Node, error) {
 		ID:      id,
 		raft:    r,
 		store:   kv.NewStore(),
-		waiters: make(map[int]chan struct{}),
+		waiters: make(map[int]chan []byte),
+		results: make(map[int][]byte),
 		applyCh: applyCh,
 		done:    make(chan struct{}),
 	}
@@ -80,7 +89,7 @@ func New(cfg *cluster.Config, id string, dataDir string) (*Node, error) {
 		return nil, fmt.Errorf("恢复的状态不一致：lastApplied=%d，但日志只有 %d 条用户条目", lastApplied, len(logEntries)-1)
 	}
 	for i := 1; i <= lastApplied; i++ {
-		if err := n.store.Apply(logEntries[i].Command); err != nil {
+		if _, err := n.store.Apply(logEntries[i].Command); err != nil {
 			return nil, fmt.Errorf("重放日志 %d 失败：%w", i, err)
 		}
 	}
@@ -91,6 +100,7 @@ func New(cfg *cluster.Config, id string, dataDir string) (*Node, error) {
 	raft.RegisterRaftHandlers(mux, r)
 	mux.HandleFunc("/kv/put", n.handlePut)
 	mux.HandleFunc("/kv/get", n.handleGet)
+	mux.HandleFunc("/kv/read", n.handleRead)
 	mux.HandleFunc("/debug/log", n.handleDebugLog)
 	n.srv = &http.Server{Addr: self.Addr, Handler: mux}
 	return n, nil
@@ -123,18 +133,29 @@ func (n *Node) Raft() *raft.Raft { return n.raft }
 func (n *Node) Store() *kv.Store { return n.store }
 
 // consumeApply 是 apply 循环的消费端：把已提交命令按序交给状态机，
-// 再通知等这条日志的 /kv/put。
+// 再通知等这条日志的 /kv/put（只等通知）与 /kv/read（拿应用结果）。
 func (n *Node) consumeApply() {
 	for {
 		select {
 		case msg := <-n.applyCh:
 			// 状态机出错只记日志：日志里的命令都是合法的，
 			// 出错即是 bug，不应让整个节点停下。
-			if err := n.store.Apply(msg.Command); err != nil {
+			result, err := n.store.Apply(msg.Command)
+			if err != nil {
 				log.Printf("节点 %s 应用日志 %d 失败：%v", n.ID, msg.Index, err)
 			}
 			n.mu.Lock()
+			n.results[msg.Index] = result
+			// 只留最近 1024 条结果（/kv/read 只等自己刚追加的下标，
+			// 旧结果留着没用）；注意：这里是在同一把锁里记结果、
+			// 再通知 waiter，不会漏通知。
+			for idx := range n.results {
+				if idx < msg.Index-1023 {
+					delete(n.results, idx)
+				}
+			}
 			if ch, ok := n.waiters[msg.Index]; ok {
+				ch <- result
 				close(ch)
 				delete(n.waiters, msg.Index)
 			}
@@ -145,14 +166,17 @@ func (n *Node) consumeApply() {
 	}
 }
 
-// waitApplied 等下标 index 的日志被应用（或超时）。
-// 注册 waiter 与“已经应用过了”的检查在同一把锁里做，不会漏通知。
-func (n *Node) waitApplied(index int, timeout time.Duration) bool {
-	ch := make(chan struct{})
+// waitAppliedResult 等下标 index 的日志被应用（或超时），
+// 返回它的应用结果（kv.ApplyResult 的 JSON）。
+// 结果是在应用那一刻记下的：刚追加的命令可能在注册 waiter 之前
+// 就已被应用，这时从 results 缓存里拿——值仍是线性化点处的值。
+// 注册 waiter 与“查缓存”的检查在同一把锁里做，不会漏通知。
+func (n *Node) waitAppliedResult(index int, timeout time.Duration) ([]byte, bool) {
+	ch := make(chan []byte, 1)
 	n.mu.Lock()
-	if n.raft.LastApplied() >= index {
+	if res, ok := n.results[index]; ok {
 		n.mu.Unlock()
-		return true
+		return res, true
 	}
 	n.waiters[index] = ch
 	n.mu.Unlock()
@@ -162,11 +186,17 @@ func (n *Node) waitApplied(index int, timeout time.Duration) bool {
 		n.mu.Unlock()
 	}()
 	select {
-	case <-ch:
-		return true
+	case result := <-ch:
+		return result, true
 	case <-time.After(timeout):
-		return false
+		return nil, false
 	}
+}
+
+// waitApplied 等下标 index 的日志被应用（或超时），只关心“应用了没有”。
+func (n *Node) waitApplied(index int, timeout time.Duration) bool {
+	_, ok := n.waitAppliedResult(index, timeout)
+	return ok
 }
 
 // ---- HTTP handler ----
@@ -232,6 +262,54 @@ func (n *Node) handleGet(w http.ResponseWriter, req *http.Request) {
 		Value string `json:"value"`
 		Found bool   `json:"found"`
 	}{Key: key, Value: value, Found: found})
+}
+
+// handleRead 是线性化读：把 Read 命令追加进 Raft 日志，
+// 等它被应用后返回应用那一刻的值（线性化点就是它在日志里
+// 提交/应用的位置）。不是 leader 时返回 503 + NotLeader（含 LeaderID），
+// 与 /kv/put 同款。注意：返回的是应用结果缓存里的值，
+// 不是 handler 现场读 Store.Get——现场读可能读到更晚的值。
+func (n *Node) handleRead(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "只接受 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var pr putRequest // 只有 key 字段用得上，与 put 共用请求体形状
+	if err := json.NewDecoder(req.Body).Decode(&pr); err != nil {
+		http.Error(w, "请求体不是合法 JSON："+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if pr.Key == "" {
+		http.Error(w, "key 不能为空", http.StatusBadRequest)
+		return
+	}
+	index, _, isLeader := n.raft.Start(kv.EncodeRead(pr.Key))
+	if !isLeader {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(putResponse{Error: "not_leader", Leader: n.raft.LeaderID()})
+		return
+	}
+	result, ok := n.waitAppliedResult(index, putWaitTimeout)
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_ = json.NewEncoder(w).Encode(putResponse{Error: "timeout"})
+		return
+	}
+	ar, err := kv.DecodeApplyResult(result)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(putResponse{Error: "bad_apply_result: " + err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+		Found bool   `json:"found"`
+	}{Key: pr.Key, Value: ar.Value, Found: ar.Found})
 }
 
 // handleDebugLog 打印当前 term、角色、日志长度、commitIndex、lastApplied。

@@ -6,7 +6,7 @@
 客户端写一条 Put，要经过选主、日志复制、多数派提交、按序应用到状态机，
 三个节点的 KV 内容最终一致；杀掉一个节点（甚至杀掉 leader）服务不中断。
 
-## 当前状态：M3（确定性模拟器）
+## 当前状态：M4（线性一致性检查）
 
 能跑的：
 
@@ -25,13 +25,18 @@
   重启、写请求）；每步检查三个不变式（同一任期最多一个 leader、
   已提交日志永不丢失、状态机按序应用）；同一种子跑两次结果完全相同。
   详见 `docs/03-testing.md`，跑 `make sim`。
+- **线性化读与线性一致性检查**：`POST /kv/read` 把读命令写进 Raft
+  日志、等应用后返回应用时刻的值（只有 leader 接受）；
+  `internal/linearizability` 用 Porcupine 做模型检查——
+  模拟器上 3 客户端并发 1000 次 Put/线性化读，20 个种子全部
+  线性一致；真实三节点集群的 smoke 测试也通过。
+  两条读路径的语义差异见 `docs/03-testing.md` 的 M4 一节。
 
 不能跑的（按规划，后面里程碑做）：
 
 - 快照与日志压缩（M5）：日志只增不减，写 10 万条后 `raft.log` 就是
   10 万条的量，启动时全量读回；每条写都 fsync、每次应用都写 meta，
   写吞吐不高——这是 M2 的设计取舍。
-- 线性一致性检查（M4）。
 - 动态加节点、Pre-Vote、ReadIndex 读优化、TLS、WATCH、跨 key 事务：
   明确不做，见 `~/workspace/tech-project-plans.md` 项目 3 的不做清单。
 
@@ -98,7 +103,8 @@ kill -9 <node1 的 PID> <node2 的 PID> <node3 的 PID>
 | 方法与路径 | 说明 |
 |---|---|
 | `POST /kv/put` `{"key","value"}` | 只有 leader 接受；不是 leader 返回 503 `{"error":"not_leader","leader":"nodeX"}`；等提交后返回 `{"ok":true,"index":N}`，3 秒没提交返回 504 |
-| `GET /kv/get?key=foo` | 读本节点的本地状态机，返回 `{"key","value","found"}`。**注意：读 follower 可能读到旧数据**（本节点 `lastApplied` 落后于 leader 的 `commitIndex`）；要读最新数据必须走日志，ReadIndex 明确不做 |
+| `GET /kv/get?key=foo` | 读本节点的本地状态机，返回 `{"key","value","found"}`。**注意：读 follower 可能读到旧数据**（本节点 `lastApplied` 落后于 leader 的 `commitIndex`）；要读最新已提交数据请用下面的 `/kv/read` |
+| `POST /kv/read` `{"key"}` | **线性化读**：把 `Read{Key}` 命令追加进 Raft 日志，等它被应用后返回应用时刻的值 `{"ok":true,"key","value","found"}`。只有 leader 接受；不是 leader 返回 503 `not_leader` + leader id；3 秒没应用返回 504。代价与 Put 相当（一次完整提交） |
 | `GET /debug/log` | `{"id","term","role","logLen","commitIndex","lastApplied","leader"}`，`logLen` 是用户日志条数（不含哨兵条目） |
 | `POST /raft/requestVote` | Raft 投票 RPC（JSON） |
 | `POST /raft/appendEntries` | Raft 日志复制 / 心跳 RPC（JSON） |
@@ -108,6 +114,8 @@ kill -9 <node1 的 PID> <node2 的 PID> <node3 的 PID>
 ```bash
 raftkv-cli --config cluster.json put foo bar
 raftkv-cli --config cluster.json get foo
+# 线性化读：走 Raft 日志，返回应用时刻的值（贵，但保证读到最新已提交值）
+raftkv-cli --config cluster.json get --linearizable foo
 ```
 
 客户端先随便连一个节点，收到 `NotLeader` 就按提示重定向到 leader；
@@ -142,7 +150,9 @@ raftkv/
 │   │   ├── crash_test.go     # 真实进程崩溃测试（kill -9 后重启恢复）
 │   │   └── transport.go      # HTTP + JSON 传输（M3：异步回调式）、term 校验
 │   ├── sim/                  # M3 确定性模拟器：虚拟时钟、模拟网络、故障注入、不变式
-│   ├── kv/store.go           # KV 状态机：Put/Delete/Get（纯逻辑，不碰网络/磁盘）
+│   │   └── concurrent.go     # M4 并发驱动：3 客户端并发 Put/线性化读，产出操作历史
+│   ├── linearizability/      # M4 Porcupine 模型检查：KV 模型（按 key 分区）+ Check 入口
+│   ├── kv/store.go           # KV 状态机：Put/Delete/Get/Read（纯逻辑，不碰网络/磁盘）
 │   ├── cluster/config.go     # 静态配置解析
 │   └── node/node.go          # 节点组装：Raft + KV + HTTP 服务 + put 等待逻辑
 ├── docs/
@@ -231,3 +241,22 @@ make sim     # 模拟器长跑：故障矩阵（9 场景 × 3 种子）+ 1000 �
 - 重构时修了一个真实竞争：不调 `Run()` 的测试节点也会排
   `time.AfterFunc` 定时器，测试结束后回调与已结束的对象竞争
   （`-race` 抓到）；现在没 `Run()` 的节点不排定时器。
+
+## M4 实测记录（2026-11-17，本机）
+
+- `go vet ./...` 全绿；`gofmt -l .` 为空；`make check` 与 `make sim`
+  通过；`scripts/demo.sh` 仍通过。
+- `go test ./... -count=1 -race`：**46 个顶层测试全绿**（M3 的 39 个
+  一个不少 + M4 新增 7 个：检查器 6 个 + `TestStore_ReadCommand` 1 个）。
+- 模拟器 20 种子（`TestLinearizability_Sim_20Seeds`）：每种子 3 客户端
+  并发 1000 次操作（Put 60% / 线性化读 40%，10 个 key，Put 值全局唯一），
+  **20/20 线性一致**；每种子约 1.9 秒，总耗时 **38.7 秒**
+  （测试内断言上限 5 分钟）；操作重叠率 99.9%（测试内断言 > 50%）。
+  耗时大头在模拟器：单次 1000 操作的 Porcupine 检查只要 ~18ms。
+- 真实集群 smoke（`TestLinearizability_RealCluster`）：真实三进程，
+  3 客户端并发 198 次操作，**线性一致**，检查耗时 1.4ms。
+- 反例：两个人工非线性历史（Put 返回后读不到、读到旧值）都被
+  检查器正确拒绝；重叠但可线性化的历史、顺序历史都通过。
+- 依赖：Porcupine `github.com/anishathalye/porcupine` **v1.3.1**
+  （测试依赖，进 go.mod/go.sum；`go get` + `go mod tidy`，与 go 1.22
+  无冲突）。详见 `docs/03-testing.md` 的 M4 一节。

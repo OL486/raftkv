@@ -6,18 +6,25 @@ import (
 
 // newTestRaft 建一个不启动 goroutine 的节点（不调 Run），
 // 单元测试直接调它的 handler 方法，不走网络。
-func newTestRaft(id string, peers []string) *Raft {
+// MemoryPersister 的 Load 首次返回零值，NewRaft 不会失败；
+// 万一失败，测试直接挂掉（这是测试脚手架，不应静默吞错）。
+func newTestRaft(t *testing.T, id string, peers []string) *Raft {
+	t.Helper()
 	addrs := make(map[string]string, len(peers))
 	for _, p := range peers {
 		addrs[p] = "127.0.0.1:1" // 占位地址，单元测试不拨号
 	}
-	return NewRaft(id, peers, addrs, NewHTTPTransport(), &MemoryPersister{}, nil)
+	r, err := NewRaft(id, peers, addrs, NewHTTPTransport(), &MemoryPersister{}, nil)
+	if err != nil {
+		t.Fatalf("建测试节点失败：%v", err)
+	}
+	return r
 }
 
 func TestHandleRequestVote_Rules(t *testing.T) {
 	peers := []string{"n1", "n2", "n3"}
 	// follower：任期 1，日志 [哨兵, {1,A}, {1,B}]，最后日志 (index 2, term 1)。
-	r := newTestRaft("n1", peers)
+	r := newTestRaft(t, "n1", peers)
 	r.currentTerm = 1
 	r.log = []LogEntry{{Term: 0}, {Term: 1, Command: []byte("A")}, {Term: 1, Command: []byte("B")}}
 
@@ -76,7 +83,7 @@ func TestHandleRequestVote_Rules(t *testing.T) {
 
 func TestHandleAppendEntries_ConflictTruncation(t *testing.T) {
 	peers := []string{"n1", "n2", "n3"}
-	r := newTestRaft("n1", peers)
+	r := newTestRaft(t, "n1", peers)
 	r.currentTerm = 1
 	// 日志 [哨兵, {1,A}, {1,B}, {1,C}]。
 	r.log = []LogEntry{{Term: 0}, {Term: 1, Command: []byte("A")}, {Term: 1, Command: []byte("B")}, {Term: 1, Command: []byte("C")}}
@@ -159,7 +166,7 @@ func TestHandleAppendEntries_ConflictTruncation(t *testing.T) {
 func TestAdvanceCommitIndex_Median(t *testing.T) {
 	peers := []string{"n1", "n2", "n3"}
 	newLeader := func(terms []int) *Raft {
-		r := newTestRaft("n1", peers)
+		r := newTestRaft(t, "n1", peers)
 		r.state = Leader
 		r.currentTerm = 2
 		r.log = []LogEntry{{Term: 0}}
@@ -217,7 +224,7 @@ func TestAdvanceCommitIndex_Median(t *testing.T) {
 }
 
 func TestStart_OnlyLeader(t *testing.T) {
-	r := newTestRaft("n1", []string{"n1", "n2", "n3"})
+	r := newTestRaft(t, "n1", []string{"n1", "n2", "n3"})
 
 	t.Run("follower 不能接受写入", func(t *testing.T) {
 		if _, _, ok := r.Start([]byte("x")); ok {
@@ -242,7 +249,7 @@ func TestStart_OnlyLeader(t *testing.T) {
 }
 
 func TestAppendEntries_StepsDownCandidate(t *testing.T) {
-	r := newTestRaft("n1", []string{"n1", "n2", "n3"})
+	r := newTestRaft(t, "n1", []string{"n1", "n2", "n3"})
 	r.state = Candidate
 	r.currentTerm = 5
 	r.votedFor = "n1" // 自己投了自己

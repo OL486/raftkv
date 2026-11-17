@@ -1,25 +1,28 @@
 package kv
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestStore_PutGetDelete(t *testing.T) {
 	s := NewStore()
 	if _, ok := s.Get("a"); ok {
 		t.Fatal("空状态机不应有 key")
 	}
-	if err := s.Apply(EncodePut("a", "1")); err != nil {
+	if _, err := s.Apply(EncodePut("a", "1")); err != nil {
 		t.Fatal(err)
 	}
 	if v, ok := s.Get("a"); !ok || v != "1" {
 		t.Fatalf("Get(a) = %q %v, want 1 true", v, ok)
 	}
-	if err := s.Apply(EncodePut("a", "2")); err != nil {
+	if _, err := s.Apply(EncodePut("a", "2")); err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := s.Get("a"); v != "2" {
 		t.Fatalf("覆盖后 Get(a) = %q, want 2", v)
 	}
-	if err := s.Apply(EncodeDelete("a")); err != nil {
+	if _, err := s.Apply(EncodeDelete("a")); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := s.Get("a"); ok {
@@ -30,12 +33,39 @@ func TestStore_PutGetDelete(t *testing.T) {
 	}
 }
 
+// TestStore_ReadCommand：线性化读是 no-op，只返回应用那一刻的值，
+// 不改数据；读不存在的 key 返回 found=false。
+func TestStore_ReadCommand(t *testing.T) {
+	s := NewStore()
+	res, err := s.Apply(EncodeRead("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r ApplyResult
+	if err := json.Unmarshal(res, &r); err != nil || r.Found {
+		t.Fatalf("读不存在的 key 应 found=false，实际 %q %v", res, err)
+	}
+	if _, err := s.Apply(EncodePut("a", "7")); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s.Apply(EncodeRead("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(res, &r); err != nil || !r.Found || r.Value != "7" {
+		t.Fatalf("读已存在的 key 应 found=true value=7，实际 %q %v", res, err)
+	}
+	if s.Len() != 1 {
+		t.Fatalf("读不应改数据，Len = %d, want 1", s.Len())
+	}
+}
+
 func TestStore_ApplyErrors(t *testing.T) {
 	s := NewStore()
-	if err := s.Apply([]byte("not json")); err == nil {
+	if _, err := s.Apply([]byte("not json")); err == nil {
 		t.Fatal("非法 JSON 命令应报错")
 	}
-	if err := s.Apply([]byte(`{"op":"wat","key":"a"}`)); err == nil {
+	if _, err := s.Apply([]byte(`{"op":"wat","key":"a"}`)); err == nil {
 		t.Fatal("未知 op 应报错")
 	}
 	if _, err := DecodeCommand([]byte("x")); err == nil {
